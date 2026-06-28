@@ -33,11 +33,16 @@ Implemented commands include:
 - `evidence`, `why`, `trace`, `audit`, `replay`, `replan`, and `rerun`
 - manual `observe`, `attest`, and `add assertion`
 
-The runtime loads project-local `.rp/` YAML, resolves local imports, merges an
+The runtime loads project-local `.rp/` YAML, resolves local imports, validates
+declared fields (unknown keys are rejected unless prefixed with `x-`), merges an
 optional user policy from `~/.config/rp/policy.yaml` (most-restrictive wins),
-computes a canonical JSON config hash, executes command capabilities serially,
-writes artifacts under `.rp/runs/<run-id>/artifacts`, records append-only JSONL
-events, and explains assertions from the latest run.
+computes a canonical JSON config hash, plans backward from goals with just-in-time
+replanning during `achieve`, executes command capabilities serially with
+execution-time precondition checks, writes artifacts under
+`.rp/runs/<run-id>/artifacts`, records append-only JSONL events (including
+`action_failed` for non-zero exits when `always_record_result` is set), and
+explains assertions from the latest run. Use `rp replay RUN_ID` for a narrative
+reconstruction of a run; `rp audit RUN_ID` prints the raw event timeline.
 
 ## Tutorial: bugfix patch
 
@@ -56,6 +61,7 @@ go run ../cmd/rp why patch.applies_cleanly
 go run ../cmd/rp why patched_repo.tests_pass
 go run ../cmd/rp evidence bugfix_patch
 go run ../cmd/rp audit "$(ls -1 .rp/runs | tail -1)"
+go run ../cmd/rp replay "$(ls -1 .rp/runs | tail -1)"
 ```
 
 After a successful run you should see:

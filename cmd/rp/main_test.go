@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -551,5 +552,223 @@ defaults:
 	}
 	if !eventMatches(events[0], planID) {
 		t.Fatal("run_started should reference the executed saved plan")
+	}
+}
+
+func TestStrictYAMLRejectsUnknownFields(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "bad.yaml")
+	body := []byte(`version: rp.dev/v0.1
+capabilities:
+  bad:
+    purpose: observe
+    kind: command
+    not_a_real_field: true
+    inputs: {}
+    outputs: {}
+    command:
+      cwd: "."
+      argv: [echo, ok]
+    effects:
+      external: local_process
+      filesystem:
+        writes: []
+`)
+	if err := os.WriteFile(path, body, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadSingleConfig(path); err == nil {
+		t.Fatal("expected unknown field error")
+	} else if !strings.Contains(err.Error(), "not_a_real_field") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestStrictYAMLAllowsExtensionFields(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "ext.yaml")
+	body := []byte(`version: rp.dev/v0.1
+x-notes: tutorial only
+capabilities:
+  ok:
+    purpose: observe
+    kind: command
+    x-custom: true
+    inputs: {}
+    outputs:
+      result:
+        type: CommandResult
+    command:
+      cwd: "."
+      argv: [echo, ok]
+    effects:
+      external: local_process
+      filesystem:
+        writes: []
+`)
+	if err := os.WriteFile(path, body, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadSingleConfig(path); err != nil {
+		t.Fatalf("extension fields should be allowed: %v", err)
+	}
+}
+
+func TestFailedActionEmitsActionFailedEvent(t *testing.T) {
+	dir := t.TempDir()
+	oldwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := os.Chdir(oldwd); err != nil {
+			t.Fatal(err)
+		}
+	}()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(".rp/runs", 0755); err != nil {
+		t.Fatal(err)
+	}
+	planner := []byte(`version: rp.dev/v0.1
+capabilities:
+  fail_cmd:
+    purpose: observe
+    kind: command
+    inputs: {}
+    outputs:
+      result:
+        type: CommandResult
+        assertions:
+          - subject: result
+            predicate: completed
+            confidence: observed
+            when:
+              exit_code: 0
+    command:
+      cwd: "."
+      argv: [/bin/sh, -c, "exit 7"]
+    always_record_result: true
+    effects:
+      external: local_process
+      filesystem:
+        writes: []
+goals:
+  smoke:
+    requires_evidence:
+      - subject: result
+        predicate: completed
+        min_confidence: observed
+policies:
+  local_safe:
+    permissions: {}
+defaults:
+  policy: local_safe
+`)
+	if err := os.WriteFile(".rp/planner.yaml", planner, 0644); err != nil {
+		t.Fatal(err)
+	}
+	err = run([]string{"achieve", "smoke"})
+	if err == nil {
+		t.Fatal("expected achieve to fail")
+	}
+	runDir, err := latestRunDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	events, err := readEvents(runDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	foundFailed, foundObservation := false, false
+	for _, ev := range events {
+		if ev.Type == "action_failed" {
+			foundFailed = true
+		}
+		if ev.Type == "observation_recorded" && ev.ActionID != "" {
+			foundObservation = true
+		}
+	}
+	if !foundFailed {
+		t.Fatal("expected action_failed event")
+	}
+	if !foundObservation {
+		t.Fatal("expected observation even on failure with always_record_result")
+	}
+}
+
+func TestCheckStepPreconditions(t *testing.T) {
+	runDir := t.TempDir()
+	events := []byte(`{"type":"assertion_recorded","data":{"id":"as-1","subject":"repo","predicate":"clean_worktree","confidence":"observed","evidence_id":"ev-1","evidence_source":"process_exit","action_id":"act-1"}}
+`)
+	if err := os.WriteFile(filepath.Join(runDir, "events.jsonl"), events, 0644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := Config{
+		Capabilities: map[string]Capability{
+			"needs_clean": {
+				Inputs: map[string]InputSpec{
+					"repo": {Requires: []Requirement{{Predicate: "clean_worktree", MinConfidence: "observed"}}},
+				},
+			},
+		},
+	}
+	step := PlanStep{Capability: "needs_clean", Inputs: map[string]string{"repo": "repo"}}
+	if err := checkStepPreconditions(runDir, cfg, step); err != nil {
+		t.Fatalf("precondition should be satisfied: %v", err)
+	}
+	step = PlanStep{Capability: "needs_clean", Inputs: map[string]string{"repo": "other"}}
+	if err := checkStepPreconditions(runDir, cfg, step); err == nil {
+		t.Fatal("expected missing precondition for other repo")
+	}
+}
+
+func TestReplayPrintsNarrative(t *testing.T) {
+	dir := t.TempDir()
+	runDir := filepath.Join(dir, ".rp", "runs", "run-test")
+	if err := os.MkdirAll(runDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	events := []byte(`{"type":"run_started","time":"2026-06-28T12:00:00Z","data":{"goal":"bugfix_patch"}}
+{"type":"assertion_recorded","time":"2026-06-28T12:00:01Z","action_id":"step-01","data":{"subject":"patch","predicate":"applies_cleanly","confidence":"observed","evidence_source":"process_exit"}}
+`)
+	if err := os.WriteFile(filepath.Join(runDir, "events.jsonl"), events, 0644); err != nil {
+		t.Fatal(err)
+	}
+	summary := []byte(`{"goal":"bugfix_patch","satisfied":true,"reason":"goal evidence requirements satisfied"}
+`)
+	if err := os.WriteFile(filepath.Join(runDir, "summary.json"), summary, 0644); err != nil {
+		t.Fatal(err)
+	}
+	oldwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := os.Chdir(oldwd); err != nil {
+			t.Fatal(err)
+		}
+	}()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	oldStdout := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stdout = w
+	err = cmdReplay([]string{"run-test"})
+	w.Close()
+	os.Stdout = oldStdout
+	if err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	_, _ = buf.ReadFrom(r)
+	out := buf.String()
+	if !strings.Contains(out, "Replay run-test") || !strings.Contains(out, "patch.applies_cleanly") {
+		t.Fatalf("unexpected replay output: %q", out)
 	}
 }

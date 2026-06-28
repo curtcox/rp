@@ -235,8 +235,10 @@ func run(args []string) error {
 		return cmdObserve(args[1:])
 	case "attest":
 		return cmdAttest(args[1:])
-	case "audit", "replay":
+	case "audit":
 		return cmdAudit(args[1:])
+	case "replay":
+		return cmdReplay(args[1:])
 	case "replan":
 		return cmdReplan(args[1:])
 	case "rerun":
@@ -547,10 +549,10 @@ func cmdAchieve(args []string) error {
 	if err != nil {
 		return err
 	}
-	return runPlan(root, cfg, configHash, fs.Arg(0), plan, "", *dryRun, *stepMode, *yes)
+	return runPlan(root, cfg, configHash, fs.Arg(0), plan, "", *dryRun, *stepMode, *yes, true)
 }
 
-func runPlan(root string, cfg Config, configHash, goalName string, plan []PlanStep, planID string, dryRun, stepMode, yes bool) error {
+func runPlan(root string, cfg Config, configHash, goalName string, plan []PlanStep, planID string, dryRun, stepMode, yes, jit bool) error {
 	if dryRun {
 		for i, step := range plan {
 			fmt.Printf("%d. %s (%s)\n", i+1, step.Capability, step.Reason)
@@ -572,11 +574,57 @@ func runPlan(root string, cfg Config, configHash, goalName string, plan []PlanSt
 		planData["plan_id"] = planID
 	}
 	appendEvent(ctx, "plan_proposed", "", planData)
+	fmt.Printf("Plan for %s (%d steps):\n", goalName, len(plan))
+	for i, step := range plan {
+		fmt.Printf("  %d. %s — %s\n", i+1, step.Capability, step.Reason)
+	}
 	resources := map[string]string{}
 	for k := range cfg.Resources {
 		resources[k] = k
 	}
-	for _, step := range plan {
+	goal := cfg.Goals[goalName]
+	executedCaps := map[string]bool{}
+	stepNum := 0
+	lastPlanCaps := planCapabilities(plan)
+	for {
+		if len(missingEvidenceWithConfig(ctx.RunDir, goal, cfg)) == 0 {
+			break
+		}
+		var steps []PlanStep
+		if jit {
+			steps, err = buildPlan(cfg, goalName)
+			if err != nil {
+				appendEvent(ctx, "run_stopped", "", map[string]interface{}{"reason": err.Error()})
+				writeSummary(ctx, goalName, false, err.Error(), missingEvidenceWithConfig(ctx.RunDir, goal, cfg))
+				return err
+			}
+			newCaps := planCapabilities(steps)
+			if stepNum > 0 && !sameCapabilities(lastPlanCaps, newCaps) {
+				appendEvent(ctx, "plan_revised", "", map[string]interface{}{"steps": steps, "reason": "evidence gap replan"})
+				fmt.Printf("Plan revised (%d steps):\n", len(steps))
+				for i, s := range steps {
+					if executedCaps[s.Capability] {
+						continue
+					}
+					fmt.Printf("  %d. %s — %s\n", i+1, s.Capability, s.Reason)
+				}
+			}
+			lastPlanCaps = newCaps
+		} else {
+			steps = plan
+		}
+		var step *PlanStep
+		for i := range steps {
+			if !executedCaps[steps[i].Capability] {
+				step = &steps[i]
+				break
+			}
+		}
+		if step == nil {
+			break
+		}
+		stepNum++
+		step.ID = fmt.Sprintf("step-%02d", stepNum)
 		if stepMode && !ask("execute "+step.Capability+"?") {
 			appendEvent(ctx, "run_stopped", "", map[string]interface{}{"reason": "step denied"})
 			return errors.New("stopped by user")
@@ -584,24 +632,31 @@ func runPlan(root string, cfg Config, configHash, goalName string, plan []PlanSt
 		capability := cfg.Capabilities[step.Capability]
 		if err := checkCapabilityPolicy(cfg, capability); err != nil {
 			appendEvent(ctx, "run_stopped", step.ID, map[string]interface{}{"reason": err.Error()})
-			writeSummary(ctx, goalName, false, err.Error(), missingEvidenceWithConfig(ctx.RunDir, cfg.Goals[goalName], cfg))
+			writeSummary(ctx, goalName, false, err.Error(), missingEvidenceWithConfig(ctx.RunDir, goal, cfg))
+			return err
+		}
+		if err := checkStepPreconditions(ctx.RunDir, cfg, *step); err != nil {
+			appendEvent(ctx, "plan_invalidated", step.ID, map[string]interface{}{"reason": err.Error(), "suggest": "replan"})
+			appendEvent(ctx, "run_stopped", "", map[string]interface{}{"reason": err.Error(), "suggest_replan": true})
+			writeSummary(ctx, goalName, false, err.Error()+"; try: rp replan "+ctx.RunID, missingEvidenceWithConfig(ctx.RunDir, goal, cfg))
 			return err
 		}
 		if needsWriteApproval(cfg, capability) && !yes {
 			appendEvent(ctx, "approval_requested", step.ID, map[string]interface{}{"permission": "filesystem.write"})
-			if !ask("approve filesystem write for " + step.Capability + "?") {
+			if !ask("approve filesystem write for "+step.Capability+"?") {
 				appendEvent(ctx, "approval_denied", step.ID, nil)
 				return errors.New("approval denied")
 			}
 			appendEvent(ctx, "approval_granted", step.ID, nil)
 		}
-		if err := executeStep(ctx, cfg, step, resources); err != nil {
+		if err := executeStep(ctx, cfg, *step, resources); err != nil {
 			appendEvent(ctx, "plan_invalidated", step.ID, map[string]interface{}{"reason": err.Error(), "suggest": "replan"})
 			appendEvent(ctx, "run_stopped", "", map[string]interface{}{"reason": err.Error(), "suggest_replan": true})
-			writeSummary(ctx, goalName, false, err.Error()+"; try: rp replan "+ctx.RunID, missingEvidenceWithConfig(ctx.RunDir, cfg.Goals[goalName], cfg))
+			writeSummary(ctx, goalName, false, err.Error()+"; try: rp replan "+ctx.RunID, missingEvidenceWithConfig(ctx.RunDir, goal, cfg))
 			return err
 		}
-		missing := missingEvidenceWithConfig(ctx.RunDir, cfg.Goals[goalName], cfg)
+		executedCaps[step.Capability] = true
+		missing := missingEvidenceWithConfig(ctx.RunDir, goal, cfg)
 		appendEvent(ctx, "goal_gap_evaluated", step.ID, map[string]interface{}{
 			"missing_count": len(missing),
 			"missing":       missing,
@@ -609,6 +664,9 @@ func runPlan(root string, cfg Config, configHash, goalName string, plan []PlanSt
 		if len(missing) == 0 {
 			appendEvent(ctx, "run_stopped", step.ID, map[string]interface{}{"reason": "goal evidence requirements satisfied"})
 			break
+		}
+		if !jit {
+			continue
 		}
 	}
 	missing := missingEvidenceWithConfig(ctx.RunDir, cfg.Goals[goalName], cfg)
@@ -809,6 +867,95 @@ func cmdAudit(args []string) error {
 	return nil
 }
 
+func cmdReplay(args []string) error {
+	if len(args) != 1 {
+		return errors.New("usage: rp replay RUN_ID")
+	}
+	runID := args[0]
+	runDir := filepath.Join(".rp", "runs", runID)
+	events, err := readEvents(runDir)
+	if err != nil {
+		return err
+	}
+	summary := map[string]interface{}{}
+	if b, err := os.ReadFile(filepath.Join(runDir, "summary.json")); err == nil {
+		_ = json.Unmarshal(b, &summary)
+	}
+	fmt.Printf("Replay %s\n", runID)
+	if goal, _ := summary["goal"].(string); goal != "" {
+		fmt.Printf("Goal: %s\n", goal)
+	}
+	if satisfied, ok := summary["satisfied"].(bool); ok {
+		fmt.Printf("Satisfied: %v\n", satisfied)
+	}
+	if reason, _ := summary["reason"].(string); reason != "" {
+		fmt.Printf("Reason: %s\n", reason)
+	}
+	fmt.Println()
+	for _, ev := range events {
+		switch ev.Type {
+		case "run_started":
+			fmt.Printf("[%s] run started", shortTime(ev.Time))
+			if g, _ := ev.Data["goal"].(string); g != "" {
+				fmt.Printf(" goal=%s", g)
+			}
+			fmt.Println()
+		case "plan_proposed", "plan_revised":
+			label := "plan proposed"
+			if ev.Type == "plan_revised" {
+				label = "plan revised"
+			}
+			n := planStepCount(ev.Data["steps"])
+			fmt.Printf("[%s] %s (%d steps)\n", shortTime(ev.Time), label, n)
+		case "approval_requested":
+			fmt.Printf("[%s] approval requested for %s (%v)\n", shortTime(ev.Time), ev.ActionID, ev.Data["permission"])
+		case "approval_granted":
+			fmt.Printf("[%s] approval granted for %s\n", shortTime(ev.Time), ev.ActionID)
+		case "approval_denied":
+			fmt.Printf("[%s] approval denied for %s\n", shortTime(ev.Time), ev.ActionID)
+		case "action_started":
+			capName, _ := ev.Data["capability"].(string)
+			fmt.Printf("[%s] action started: %s (%s)\n", shortTime(ev.Time), ev.ActionID, capName)
+		case "action_completed":
+			fmt.Printf("[%s] action completed: %s exit=%v\n", shortTime(ev.Time), ev.ActionID, ev.Data["exit_code"])
+		case "action_failed":
+			fmt.Printf("[%s] action failed: %s exit=%v\n", shortTime(ev.Time), ev.ActionID, ev.Data["exit_code"])
+		case "observation_recorded":
+			fmt.Printf("[%s] observation %v exit=%v\n", shortTime(ev.Time), ev.Data["id"], ev.Data["exit_code"])
+		case "evidence_recorded":
+			fmt.Printf("[%s] evidence %v (%v)\n", shortTime(ev.Time), ev.Data["id"], ev.Data["source_type"])
+		case "assertion_recorded":
+			subject, _ := ev.Data["subject"].(string)
+			predicate, _ := ev.Data["predicate"].(string)
+			confidence, _ := ev.Data["confidence"].(string)
+			source, _ := ev.Data["evidence_source"].(string)
+			fmt.Printf("[%s] assertion %s.%s confidence=%s source=%s\n", shortTime(ev.Time), subject, predicate, confidence, source)
+		case "resource_realization_recorded":
+			fmt.Printf("[%s] resource realization %v\n", shortTime(ev.Time), ev.Data["resource"])
+		case "artifact_recorded":
+			fmt.Printf("[%s] artifact %v\n", shortTime(ev.Time), ev.Data["path"])
+		case "goal_gap_evaluated":
+			fmt.Printf("[%s] goal gap: %v missing requirement(s)\n", shortTime(ev.Time), ev.Data["missing_count"])
+		case "goal_satisfied":
+			fmt.Printf("[%s] goal satisfied=%v\n", shortTime(ev.Time), ev.Data["satisfied"])
+		case "plan_invalidated":
+			fmt.Printf("[%s] plan invalidated: %v\n", shortTime(ev.Time), ev.Data["reason"])
+		case "run_stopped":
+			fmt.Printf("[%s] run stopped: %v\n", shortTime(ev.Time), ev.Data["reason"])
+		default:
+			fmt.Printf("[%s] %s\n", shortTime(ev.Time), ev.Type)
+		}
+	}
+	assertions, err := assertionsFromRun(runDir)
+	if err == nil && len(assertions) > 0 {
+		fmt.Println("\nAssertions:")
+		for _, as := range assertions {
+			fmt.Printf("  %s.%s %s (via %s, action %s)\n", as.Subject, as.Predicate, as.Confidence, as.EvidenceSource, as.ActionID)
+		}
+	}
+	return nil
+}
+
 func cmdReplan(args []string) error {
 	if len(args) != 1 {
 		return errors.New("usage: rp replan RUN_ID")
@@ -862,7 +1009,7 @@ func cmdExec(args []string) error {
 	if plan.ConfigHash != configHash {
 		return fmt.Errorf("saved plan %s was built for config %s, current config is %s; replan before exec", plan.ID, shortHash(plan.ConfigHash), shortHash(configHash))
 	}
-	return runPlan(root, cfg, configHash, plan.Goal, plan.Steps, plan.ID, *dryRun, *stepMode, *yes)
+	return runPlan(root, cfg, configHash, plan.Goal, plan.Steps, plan.ID, *dryRun, *stepMode, *yes, false)
 }
 
 func loadProject() (string, Config, string, error) {
@@ -1143,14 +1290,322 @@ func loadSingleConfig(path string) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	var root yaml.Node
+	if err := yaml.Unmarshal(b, &root); err != nil {
+		return Config{}, fmt.Errorf("%s: %w", path, err)
+	}
+	if err := validateYAMLDocument(&root, path); err != nil {
+		return Config{}, err
+	}
 	var cfg Config
 	if err := yaml.Unmarshal(b, &cfg); err != nil {
-		return Config{}, err
+		return Config{}, fmt.Errorf("%s: %w", path, err)
 	}
 	if cfg.Version != "" && cfg.Version != version {
 		return Config{}, fmt.Errorf("%s: unsupported version %q", path, cfg.Version)
 	}
 	return cfg, nil
+}
+
+func checkStepPreconditions(runDir string, cfg Config, step PlanStep) error {
+	capability := cfg.Capabilities[step.Capability]
+	assertions, err := assertionsFromRun(runDir)
+	if err != nil {
+		return err
+	}
+	for inputName, input := range capability.Inputs {
+		for _, req := range input.Requires {
+			subject := req.Subject
+			if subject == "" {
+				subject = step.Inputs[inputName]
+			}
+			if subject == "" {
+				subject = inputName
+			}
+			if !assertionRequirementMet(assertions, req, subject, cfg) {
+				return fmt.Errorf("precondition %s.%s>=%s not satisfied for %s", subject, req.Predicate, req.MinConfidence, step.Capability)
+			}
+		}
+	}
+	for _, req := range capability.Preconditions {
+		subject := req.Subject
+		if subject == "" {
+			subject = step.Inputs["repo"]
+		}
+		if !assertionRequirementMet(assertions, req, subject, cfg) {
+			return fmt.Errorf("precondition %s.%s>=%s not satisfied for %s", subject, req.Predicate, req.MinConfidence, step.Capability)
+		}
+	}
+	return nil
+}
+
+func assertionRequirementMet(assertions []AssertionRecord, req Requirement, subject string, cfg Config) bool {
+	for _, as := range assertions {
+		if as.Subject == subject && as.Predicate == req.Predicate &&
+			confidenceAtLeast(as.Confidence, req.MinConfidence) &&
+			sourceAllowed(as.EvidenceSource, req.AnySourceType) &&
+			sourceMaySatisfyRequiredEvidence(cfg, as.EvidenceSource) {
+			return true
+		}
+	}
+	return false
+}
+
+func planCapabilities(plan []PlanStep) []string {
+	caps := make([]string, len(plan))
+	for i, step := range plan {
+		caps[i] = step.Capability
+	}
+	return caps
+}
+
+func sameCapabilities(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func planStepCount(raw interface{}) int {
+	items, ok := raw.([]interface{})
+	if !ok {
+		return 0
+	}
+	return len(items)
+}
+
+func shortTime(ts string) string {
+	if len(ts) >= 19 {
+		return ts[:19]
+	}
+	return ts
+}
+
+var configRootKeys = map[string]bool{
+	"version": true, "imports": true, "resources": true, "capabilities": true,
+	"policies": true, "goals": true, "defaults": true,
+}
+
+var resourceKeys = map[string]bool{"type": true, "realizations": true}
+var realizationKeys = map[string]bool{"id": true, "kind": true, "uri": true, "media_type": true, "hash": true, "metadata": true}
+var capabilityKeys = map[string]bool{
+	"purpose": true, "kind": true, "inputs": true, "outputs": true, "preconditions": true,
+	"command": true, "approval": true, "always_record_result": true, "effects": true,
+	"nondeterminism": true, "idempotence": true, "cost": true,
+}
+var inputSpecKeys = map[string]bool{"type": true, "realization": true, "requires": true}
+var requirementKeys = map[string]bool{"subject": true, "predicate": true, "min_confidence": true, "any_source_type": true}
+var outputSpecKeys = map[string]bool{"type": true, "required_realization": true, "realization": true, "assertions": true}
+var assertionSpecKeys = map[string]bool{"subject": true, "predicate": true, "object": true, "confidence": true, "when": true, "evidence_source": true}
+var commandKeys = map[string]bool{"cwd": true, "argv": true, "stdout": true, "stderr": true}
+var streamKeys = map[string]bool{"save_as": true, "save_as_artifact": true, "media_type": true}
+var saveAsKeys = map[string]bool{"resource": true, "artifact_path": true, "media_type": true}
+var effectKeys = map[string]bool{"external": true, "planner": true, "filesystem": true, "network": true}
+var policyKeys = map[string]bool{
+	"description": true, "permissions": true, "environment": true, "evidence": true,
+	"hashing": true, "execution": true, "max_cost": true,
+}
+var goalKeys = map[string]bool{"description": true, "given": true, "produce": true, "requires_evidence": true, "constraints": true}
+
+func validateYAMLDocument(root *yaml.Node, path string) error {
+	doc := root
+	if doc.Kind == yaml.DocumentNode && len(doc.Content) > 0 {
+		doc = doc.Content[0]
+	}
+	return validateMapping(doc, path, configRootKeys, map[string]map[string]bool{
+		"resources":    resourceKeys,
+		"capabilities": capabilityKeys,
+		"policies":     policyKeys,
+		"goals":        goalKeys,
+	})
+}
+
+func validateMapping(node *yaml.Node, path string, allowed map[string]bool, nested map[string]map[string]bool) error {
+	if node == nil || node.Kind != yaml.MappingNode {
+		return nil
+	}
+	for i := 0; i < len(node.Content); i += 2 {
+		keyNode := node.Content[i]
+		valNode := node.Content[i+1]
+		key := keyNode.Value
+		if isExtensionKey(key) {
+			continue
+		}
+		if !allowed[key] {
+			return fmt.Errorf("%s: unknown field %q (use x-* prefix for extensions)", path, key)
+		}
+		childPath := path + "." + key
+		if valNode.Kind == yaml.MappingNode {
+			if _, ok := nested[key]; ok {
+				if key == "resources" || key == "capabilities" || key == "policies" || key == "goals" {
+					if err := validateNamedItems(valNode, childPath, nested[key], nil); err != nil {
+						return err
+					}
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func validateNamedItems(node *yaml.Node, path string, itemAllowed map[string]bool, _ map[string]map[string]bool) error {
+	for i := 0; i < len(node.Content); i += 2 {
+		name := node.Content[i].Value
+		item := node.Content[i+1]
+		itemPath := path + "." + name
+		if err := validateMapping(item, itemPath, itemAllowed, nil); err != nil {
+			return err
+		}
+		if item.Kind == yaml.MappingNode {
+			if err := validateCapabilityBody(item, itemPath); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func validateCapabilityBody(node *yaml.Node, path string) error {
+	for i := 0; i < len(node.Content); i += 2 {
+		key := node.Content[i].Value
+		val := node.Content[i+1]
+		childPath := path + "." + key
+		switch key {
+		case "inputs", "outputs":
+			if val.Kind == yaml.MappingNode {
+				itemKeys := inputSpecKeys
+				if key == "outputs" {
+					itemKeys = outputSpecKeys
+				}
+				for j := 0; j < len(val.Content); j += 2 {
+					if err := validateMapping(val.Content[j+1], childPath+"."+val.Content[j].Value, itemKeys, map[string]map[string]bool{
+						"realization": realizationKeys, "requires": requirementKeys, "assertions": assertionSpecKeys,
+						"required_realization": realizationKeys,
+					}); err != nil {
+						return err
+					}
+					if err := validateInputOutputBody(val.Content[j+1], childPath+"."+val.Content[j].Value); err != nil {
+						return err
+					}
+				}
+			}
+		case "command":
+			if err := validateMapping(val, childPath, commandKeys, map[string]map[string]bool{
+				"stdout": streamKeys, "stderr": streamKeys,
+			}); err != nil {
+				return err
+			}
+			for j := 0; j < len(val.Content); j += 2 {
+				if val.Content[j].Value == "stdout" || val.Content[j].Value == "stderr" {
+					if err := validateStream(val.Content[j+1], childPath+"."+val.Content[j].Value); err != nil {
+						return err
+					}
+				}
+			}
+		case "effects":
+			if err := validateMapping(val, childPath, effectKeys, nil); err != nil {
+				return err
+			}
+			for j := 0; j < len(val.Content); j += 2 {
+				if val.Content[j].Value == "filesystem" && val.Content[j+1].Kind == yaml.MappingNode {
+					if err := validateOpenMapping(val.Content[j+1], childPath+".filesystem", map[string]bool{"writes": true, "reads": true}); err != nil {
+						return err
+					}
+				}
+			}
+		case "preconditions":
+			if val.Kind == yaml.SequenceNode {
+				for _, item := range val.Content {
+					if err := validateMapping(item, childPath+"[]", requirementKeys, nil); err != nil {
+						return err
+					}
+				}
+			}
+		case "realizations":
+			if val.Kind == yaml.SequenceNode {
+				for _, item := range val.Content {
+					if err := validateMapping(item, childPath+"[]", realizationKeys, nil); err != nil {
+						return err
+					}
+				}
+			}
+		case "permissions", "environment", "evidence", "hashing", "execution", "max_cost", "constraints", "given", "produce", "cost", "approval":
+			// semi-structured policy/goal sections; top-level keys already checked
+		}
+	}
+	return nil
+}
+
+func validateOpenMapping(node *yaml.Node, path string, allowed map[string]bool) error {
+	if node == nil || node.Kind != yaml.MappingNode {
+		return nil
+	}
+	for i := 0; i < len(node.Content); i += 2 {
+		key := node.Content[i].Value
+		if isExtensionKey(key) {
+			continue
+		}
+		if !allowed[key] {
+			return fmt.Errorf("%s: unknown field %q (use x-* prefix for extensions)", path, key)
+		}
+	}
+	return nil
+}
+
+func validateInputOutputBody(node *yaml.Node, path string) error {
+	if node.Kind != yaml.MappingNode {
+		return nil
+	}
+	for i := 0; i < len(node.Content); i += 2 {
+		key := node.Content[i].Value
+		val := node.Content[i+1]
+		switch key {
+		case "requires":
+			if val.Kind == yaml.SequenceNode {
+				for _, item := range val.Content {
+					if err := validateMapping(item, path+".requires[]", requirementKeys, nil); err != nil {
+						return err
+					}
+				}
+			}
+		case "assertions":
+			if val.Kind == yaml.SequenceNode {
+				for _, item := range val.Content {
+					if err := validateMapping(item, path+".assertions[]", assertionSpecKeys, nil); err != nil {
+						return err
+					}
+				}
+			}
+		case "realization", "required_realization":
+			if err := validateMapping(val, path+"."+key, realizationKeys, nil); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func validateStream(node *yaml.Node, path string) error {
+	if err := validateMapping(node, path, streamKeys, map[string]map[string]bool{"save_as": saveAsKeys}); err != nil {
+		return err
+	}
+	for i := 0; i < len(node.Content); i += 2 {
+		if node.Content[i].Value == "save_as" {
+			if err := validateMapping(node.Content[i+1], path+".save_as", saveAsKeys, nil); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func isExtensionKey(key string) bool {
+	return strings.HasPrefix(key, "x-")
 }
 
 func mergeConfig(dst *Config, src Config) {
@@ -1374,10 +1829,15 @@ func executeStep(ctx RunContext, cfg Config, step PlanStep, resources map[string
 			}
 		}
 	}
-	appendEvent(ctx, "action_completed", actionID, map[string]interface{}{"exit_code": exitCode})
 	if exitCode != 0 {
-		return fmt.Errorf("%s failed with exit code %d", step.Capability, exitCode)
+		appendEvent(ctx, "action_failed", actionID, map[string]interface{}{"exit_code": exitCode})
+		msg := fmt.Sprintf("%s failed with exit code %d", step.Capability, exitCode)
+		if capability.AlwaysRecordResult {
+			msg += " (result recorded)"
+		}
+		return errors.New(msg)
 	}
+	appendEvent(ctx, "action_completed", actionID, map[string]interface{}{"exit_code": exitCode})
 	return nil
 }
 
