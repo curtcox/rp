@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -595,8 +596,9 @@ func runPlan(root string, cfg Config, configHash, goalName string, plan []PlanSt
 			appendEvent(ctx, "approval_granted", step.ID, nil)
 		}
 		if err := executeStep(ctx, cfg, step, resources); err != nil {
-			appendEvent(ctx, "run_stopped", "", map[string]interface{}{"reason": err.Error()})
-			writeSummary(ctx, goalName, false, err.Error(), missingEvidenceWithConfig(ctx.RunDir, cfg.Goals[goalName], cfg))
+			appendEvent(ctx, "plan_invalidated", step.ID, map[string]interface{}{"reason": err.Error(), "suggest": "replan"})
+			appendEvent(ctx, "run_stopped", "", map[string]interface{}{"reason": err.Error(), "suggest_replan": true})
+			writeSummary(ctx, goalName, false, err.Error()+"; try: rp replan "+ctx.RunID, missingEvidenceWithConfig(ctx.RunDir, cfg.Goals[goalName], cfg))
 			return err
 		}
 		missing := missingEvidenceWithConfig(ctx.RunDir, cfg.Goals[goalName], cfg)
@@ -872,11 +874,230 @@ func loadProject() (string, Config, string, error) {
 	if err != nil {
 		return "", Config{}, "", err
 	}
+	cfg = applyUserPolicy(cfg)
 	hash, err := canonicalHash(cfg)
 	if err != nil {
 		return "", Config{}, "", err
 	}
 	return root, cfg, hash, nil
+}
+
+func applyUserPolicy(cfg Config) Config {
+	user, ok, err := loadUserPolicy()
+	if err != nil || !ok {
+		return cfg
+	}
+	policyName := cfg.Defaults["policy"]
+	if policyName == "" {
+		return cfg
+	}
+	if cfg.Policies == nil {
+		cfg.Policies = map[string]Policy{}
+	}
+	project := cfg.Policies[policyName]
+	cfg.Policies[policyName] = mergePolicies(project, user)
+	return cfg
+}
+
+func loadUserPolicy() (Policy, bool, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return Policy{}, false, err
+	}
+	path := filepath.Join(home, ".config", "rp", "policy.yaml")
+	b, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return Policy{}, false, nil
+		}
+		return Policy{}, false, err
+	}
+	var doc struct {
+		Version  string             `yaml:"version"`
+		Policies map[string]Policy  `yaml:"policies,omitempty"`
+		Policy   Policy             `yaml:"policy,omitempty"`
+	}
+	if err := yaml.Unmarshal(b, &doc); err != nil {
+		return Policy{}, false, fmt.Errorf("%s: %w", path, err)
+	}
+	if doc.Version != "" && doc.Version != version {
+		return Policy{}, false, fmt.Errorf("%s: unsupported version %q", path, doc.Version)
+	}
+	if len(doc.Policies) > 0 {
+		for _, name := range sortedKeys(doc.Policies) {
+			return doc.Policies[name], true, nil
+		}
+	}
+	if doc.Policy.Description != "" || len(doc.Policy.Permissions) > 0 {
+		return doc.Policy, true, nil
+	}
+	return Policy{}, false, nil
+}
+
+func mergePolicies(project, user Policy) Policy {
+	out := project
+	out.Permissions = mergePermissionMaps(project.Permissions, user.Permissions)
+	if len(user.Environment.Allow) > 0 {
+		out.Environment.Inherit = project.Environment.Inherit && user.Environment.Inherit
+		out.Environment.Allow = intersectStrings(project.Environment.Allow, user.Environment.Allow)
+	}
+	out.Evidence = mergeEvidenceMaps(project.Evidence, user.Evidence)
+	out.MaxCost = mergeCostMaps(project.MaxCost, user.MaxCost)
+	return out
+}
+
+func mergePermissionMaps(project, user map[string]interface{}) map[string]interface{} {
+	if len(project) == 0 {
+		return user
+	}
+	if len(user) == 0 {
+		return project
+	}
+	out := map[string]interface{}{}
+	for _, section := range sortedKeys(unionMapKeys(project, user)) {
+		pSection, _ := project[section].(map[string]interface{})
+		uSection, _ := user[section].(map[string]interface{})
+		if pSection == nil && uSection == nil {
+			continue
+		}
+		if pSection == nil {
+			out[section] = uSection
+			continue
+		}
+		if uSection == nil {
+			out[section] = pSection
+			continue
+		}
+		merged := map[string]interface{}{}
+		for _, key := range sortedKeys(unionMapKeys(pSection, uSection)) {
+			pVal, _ := pSection[key].(string)
+			uVal, _ := uSection[key].(string)
+			switch {
+			case pVal == "":
+				merged[key] = uSection[key]
+			case uVal == "":
+				merged[key] = pSection[key]
+			default:
+				merged[key] = mostRestrictivePermission(pVal, uVal)
+			}
+		}
+		out[section] = merged
+	}
+	return out
+}
+
+func mergeEvidenceMaps(project, user map[string]interface{}) map[string]interface{} {
+	if len(user) == 0 {
+		return project
+	}
+	if len(project) == 0 {
+		return user
+	}
+	out := map[string]interface{}{}
+	for k, v := range project {
+		out[k] = v
+	}
+	for k, v := range user {
+		switch k {
+		case "source_limits", "final_goal_rules":
+			out[k] = appendEvidenceRules(out[k], v)
+		default:
+			out[k] = v
+		}
+	}
+	return out
+}
+
+func appendEvidenceRules(existing, extra interface{}) []interface{} {
+	var rules []interface{}
+	if existing != nil {
+		if items, ok := existing.([]interface{}); ok {
+			rules = append(rules, items...)
+		}
+	}
+	if extra != nil {
+		if items, ok := extra.([]interface{}); ok {
+			rules = append(rules, items...)
+		}
+	}
+	return rules
+}
+
+func mergeCostMaps(project, user map[string]interface{}) map[string]interface{} {
+	if len(user) == 0 {
+		return project
+	}
+	if len(project) == 0 {
+		return user
+	}
+	out := map[string]interface{}{}
+	for k, v := range project {
+		out[k] = v
+	}
+	for k, uVal := range user {
+		pVal, ok := out[k]
+		if !ok {
+			out[k] = uVal
+			continue
+		}
+		if pStr, ok := pVal.(string); ok {
+			if uStr, ok := uVal.(string); ok {
+				out[k] = minCostString(pStr, uStr)
+			}
+		}
+	}
+	return out
+}
+
+func mostRestrictivePermission(a, b string) string {
+	rank := map[string]int{"forbidden": 0, "approval_required": 1, "allowed": 2}
+	if rank[a] <= rank[b] {
+		return a
+	}
+	return b
+}
+
+func minCostString(a, b string) string {
+	if strings.HasSuffix(a, "m") && strings.HasSuffix(b, "m") {
+		aMin, errA := strconv.Atoi(strings.TrimSuffix(a, "m"))
+		bMin, errB := strconv.Atoi(strings.TrimSuffix(b, "m"))
+		if errA == nil && errB == nil && bMin < aMin {
+			return b
+		}
+	}
+	return a
+}
+
+func unionMapKeys(a, b map[string]interface{}) map[string]interface{} {
+	out := map[string]interface{}{}
+	for k := range a {
+		out[k] = nil
+	}
+	for k := range b {
+		out[k] = nil
+	}
+	return out
+}
+
+func intersectStrings(a, b []string) []string {
+	if len(a) == 0 {
+		return b
+	}
+	if len(b) == 0 {
+		return a
+	}
+	set := map[string]bool{}
+	for _, s := range a {
+		set[s] = true
+	}
+	var out []string
+	for _, s := range b {
+		if set[s] {
+			out = append(out, s)
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 func findProjectRoot() (string, error) {
@@ -1037,7 +1258,51 @@ func buildPlan(cfg Config, goalName string) ([]PlanStep, error) {
 	if len(steps) == 0 {
 		return nil, errors.New("no plan found")
 	}
+	sort.Slice(steps, func(i, j int) bool {
+		pi, pj := planStepPriority(cfg, steps[i]), planStepPriority(cfg, steps[j])
+		if pi != pj {
+			return pi < pj
+		}
+		return steps[i].Capability < steps[j].Capability
+	})
+	for i := range steps {
+		steps[i].ID = fmt.Sprintf("step-%02d", i+1)
+	}
 	return steps, nil
+}
+
+func planStepPriority(cfg Config, step PlanStep) int {
+	capability, ok := cfg.Capabilities[step.Capability]
+	if !ok {
+		return 100
+	}
+	for _, out := range capability.Outputs {
+		for _, as := range out.Assertions {
+			switch as.Predicate {
+			case "clean_worktree":
+				return 10
+			case "applies_cleanly":
+				return 30
+			case "tests_pass":
+				return 50
+			}
+		}
+	}
+	for name := range capability.Outputs {
+		switch name {
+		case "patch":
+			return 20
+		case "patched_repo":
+			return 40
+		}
+	}
+	if capability.Purpose == "observe" {
+		return 25
+	}
+	if capability.Purpose == "derive" {
+		return 35
+	}
+	return 45
 }
 
 func executeStep(ctx RunContext, cfg Config, step PlanStep, resources map[string]string) error {
@@ -1436,7 +1701,10 @@ func findAssertionCapability(cfg Config, subject, predicate string) string {
 		cap := cfg.Capabilities[name]
 		for _, out := range cap.Outputs {
 			for _, as := range out.Assertions {
-				if as.Predicate == predicate && (as.Subject == subject || subject == "") {
+				if as.Predicate != predicate {
+					continue
+				}
+				if as.Subject == subject || as.Subject == "" || subject == "" {
 					return name
 				}
 			}
@@ -1576,11 +1844,30 @@ func canonicalHash(cfg Config) (string, error) {
 	if err := json.Unmarshal(b, &normalized); err != nil {
 		return "", err
 	}
-	b, err = json.Marshal(normalized)
+	b, err = json.Marshal(canonicalize(normalized))
 	if err != nil {
 		return "", err
 	}
 	return sha(b), nil
+}
+
+func canonicalize(v interface{}) interface{} {
+	switch x := v.(type) {
+	case map[string]interface{}:
+		out := make(map[string]interface{}, len(x))
+		for _, k := range sortedKeys(x) {
+			out[k] = canonicalize(x[k])
+		}
+		return out
+	case []interface{}:
+		out := make([]interface{}, len(x))
+		for i, item := range x {
+			out[i] = canonicalize(item)
+		}
+		return out
+	default:
+		return v
+	}
 }
 
 func hashPolicy(cfg Config) string {

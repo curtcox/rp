@@ -4,8 +4,191 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 )
+
+func TestBuildPlanBugfixOrdering(t *testing.T) {
+	cfg := Config{
+		Resources: map[string]Resource{
+			"repo":       {Type: "GitRepo"},
+			"bug_report": {Type: "BugReport"},
+		},
+		Capabilities: map[string]Capability{
+			"run_tests": {
+				Purpose: "observe",
+				Outputs: map[string]OutputSpec{"test_result": {Assertions: []AssertionSpec{{Predicate: "tests_pass"}}}},
+			},
+			"apply_patch_to_worktree": {
+				Purpose: "derive",
+				Outputs: map[string]OutputSpec{"patched_repo": {}},
+			},
+			"check_patch_applies": {
+				Purpose: "observe",
+				Outputs: map[string]OutputSpec{"patch_apply_result": {Assertions: []AssertionSpec{{Predicate: "applies_cleanly"}}}},
+			},
+			"propose_patch_with_script": {
+				Purpose: "derive",
+				Inputs: map[string]InputSpec{"repo": {Requires: []Requirement{{Predicate: "clean_worktree"}}}},
+				Outputs: map[string]OutputSpec{"patch": {}},
+			},
+			"observe_git_status": {
+				Purpose: "observe",
+				Outputs: map[string]OutputSpec{"status": {Assertions: []AssertionSpec{{Predicate: "clean_worktree"}}}},
+			},
+		},
+		Goals: map[string]Goal{
+			"bugfix_patch": {
+				Given:   map[string]string{"repo": "repo", "bug_report": "bug_report"},
+				Produce: map[string]OutputSpec{"patch": {}},
+				RequiresEvidence: []Requirement{
+					{Subject: "patch", Predicate: "applies_cleanly", MinConfidence: "observed"},
+					{Subject: "patched_repo", Predicate: "tests_pass", MinConfidence: "observed"},
+				},
+			},
+		},
+	}
+	plan, err := buildPlan(cfg, "bugfix_patch")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		"observe_git_status",
+		"propose_patch_with_script",
+		"check_patch_applies",
+		"apply_patch_to_worktree",
+		"run_tests",
+	}
+	if len(plan) != len(want) {
+		t.Fatalf("expected %d steps, got %d: %+v", len(want), len(plan), plan)
+	}
+	for i, name := range want {
+		if plan[i].Capability != name {
+			t.Fatalf("step %d: expected %s, got %s", i+1, name, plan[i].Capability)
+		}
+	}
+}
+
+func TestMergePoliciesMostRestrictive(t *testing.T) {
+	project := Policy{Permissions: map[string]interface{}{
+		"network":      map[string]interface{}{"access": "allowed"},
+		"filesystem":   map[string]interface{}{"write": "allowed"},
+		"credentials":  map[string]interface{}{"use": "forbidden"},
+	}}
+	user := Policy{Permissions: map[string]interface{}{
+		"network":    map[string]interface{}{"access": "forbidden"},
+		"filesystem": map[string]interface{}{"write": "approval_required"},
+	}}
+	merged := mergePolicies(project, user)
+	if permissionValue(merged.Permissions, "network", "access") != "forbidden" {
+		t.Fatal("network should be forbidden")
+	}
+	if permissionValue(merged.Permissions, "filesystem", "write") != "approval_required" {
+		t.Fatal("filesystem write should require approval")
+	}
+	if permissionValue(merged.Permissions, "credentials", "use") != "forbidden" {
+		t.Fatal("project credential rule should remain")
+	}
+}
+
+func TestExampleProjectBugfixAchieve(t *testing.T) {
+	exampleRoot := filepath.Join("..", "..", "example-project")
+	if _, err := os.Stat(filepath.Join(exampleRoot, ".rp", "planner.yaml")); err != nil {
+		t.Skip("example-project fixture not present")
+	}
+	dir := t.TempDir()
+	copyDir(t, exampleRoot, dir)
+	oldwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := os.Chdir(oldwd); err != nil {
+			t.Fatal(err)
+		}
+	}()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	if err := exec.Command("git", "init").Run(); err != nil {
+		t.Skipf("git init failed: %v", err)
+	}
+	if err := exec.Command("git", "add", "-A").Run(); err != nil {
+		t.Fatal(err)
+	}
+	if err := exec.Command("git", "commit", "-m", "initial").Run(); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"achieve", "bugfix_patch", "--yes"}); err != nil {
+		t.Fatal(err)
+	}
+	runDir, err := latestRunDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"artifacts/proposed.patch", "artifacts/pytest.stdout", "events.jsonl", "summary.json"} {
+		if _, err := os.Stat(filepath.Join(runDir, name)); err != nil {
+			t.Fatalf("missing %s: %v", name, err)
+		}
+	}
+	summaryBytes, err := os.ReadFile(filepath.Join(runDir, "summary.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(summaryBytes), `"satisfied": true`) {
+		t.Fatalf("expected satisfied summary, got %s", summaryBytes)
+	}
+	assertions, err := assertionsFromRun(runDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	foundApply, foundTests := false, false
+	for _, as := range assertions {
+		if as.Subject == "patch" && as.Predicate == "applies_cleanly" {
+			foundApply = true
+		}
+		if as.Subject == "patched_repo" && as.Predicate == "tests_pass" {
+			foundTests = true
+		}
+	}
+	if !foundApply || !foundTests {
+		t.Fatalf("missing goal assertions: apply=%v tests=%v all=%+v", foundApply, foundTests, assertions)
+	}
+}
+
+func copyDir(t *testing.T, src, dst string) {
+	t.Helper()
+	err := filepath.Walk(src, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(src, path)
+		if err != nil {
+			return err
+		}
+		if rel == ".git" || strings.HasPrefix(rel, ".git"+string(filepath.Separator)) {
+			return nil
+		}
+		if strings.HasPrefix(rel, ".rp"+string(filepath.Separator)+"runs") || strings.HasPrefix(rel, ".rp"+string(filepath.Separator)+"cache") {
+			if info.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		target := filepath.Join(dst, rel)
+		if info.IsDir() {
+			return os.MkdirAll(target, 0755)
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		return os.WriteFile(target, data, info.Mode())
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
 
 func TestAssertionMatches(t *testing.T) {
 	as := AssertionSpec{When: map[string]interface{}{"exit_code": 0, "stdout_matches": "^$"}}
