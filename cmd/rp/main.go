@@ -276,8 +276,8 @@ Usage:
   rp add assertion SUBJECT.PREDICATE [--subject SUBJECT] [--confidence LEVEL]
   rp audit RUN_ID
   rp replay RUN_ID
-  rp replan RUN_ID
-  rp rerun RUN_ID`)
+  rp replan RUN_ID [--yes] [--step]
+  rp rerun RUN_ID [--yes] [--step] [--auto-repair] [--max-attempts N]`)
 }
 
 func cmdInit(args []string) error {
@@ -550,34 +550,55 @@ func cmdAchieve(args []string) error {
 		return err
 	}
 	repairEnabled, repairMax := autoRepairSettings(cfg, *autoRepair, *maxAttempts)
-	return runPlan(root, cfg, configHash, fs.Arg(0), plan, "", *dryRun, *stepMode, *yes, true, repairEnabled, repairMax)
+	return runPlan(root, cfg, configHash, fs.Arg(0), plan, "", *dryRun, *stepMode, *yes, true, repairEnabled, repairMax, "")
 }
 
-func runPlan(root string, cfg Config, configHash, goalName string, plan []PlanStep, planID string, dryRun, stepMode, yes, jit bool, autoRepair bool, maxAttempts int) error {
+func runPlan(root string, cfg Config, configHash, goalName string, plan []PlanStep, planID string, dryRun, stepMode, yes, jit bool, autoRepair bool, maxAttempts int, resumeRunID string) error {
 	if dryRun {
 		for i, step := range plan {
 			fmt.Printf("%d. %s (%s)\n", i+1, step.Capability, step.Reason)
 		}
 		return nil
 	}
-	ctx, err := newRun(root, configHash, hashPolicy(cfg))
-	if err != nil {
-		return err
+	var ctx RunContext
+	var err error
+	resuming := resumeRunID != ""
+	if resuming {
+		ctx, err = openRun(root, resumeRunID)
+		if err != nil {
+			return err
+		}
+		if ctx.ConfigHash != configHash {
+			return fmt.Errorf("run %s config hash %s does not match current config %s; replan with matching config or re-achieve", resumeRunID, shortHash(ctx.ConfigHash), shortHash(configHash))
+		}
+	} else {
+		ctx, err = newRun(root, configHash, hashPolicy(cfg))
+		if err != nil {
+			return err
+		}
 	}
 	defer ctx.Events.Close()
-	startData := map[string]interface{}{"goal": goalName, "config_hash": configHash}
-	if planID != "" {
-		startData["plan_id"] = planID
-	}
-	appendEvent(ctx, "run_started", "", startData)
-	planData := map[string]interface{}{"steps": plan}
-	if planID != "" {
-		planData["plan_id"] = planID
-	}
-	appendEvent(ctx, "plan_proposed", "", planData)
-	fmt.Printf("Plan for %s (%d steps):\n", goalName, len(plan))
-	for i, step := range plan {
-		fmt.Printf("  %d. %s — %s\n", i+1, step.Capability, step.Reason)
+	if !resuming {
+		startData := map[string]interface{}{"goal": goalName, "config_hash": configHash}
+		if planID != "" {
+			startData["plan_id"] = planID
+		}
+		appendEvent(ctx, "run_started", "", startData)
+		planData := map[string]interface{}{"steps": plan}
+		if planID != "" {
+			planData["plan_id"] = planID
+		}
+		appendEvent(ctx, "plan_proposed", "", planData)
+		fmt.Printf("Plan for %s (%d steps):\n", goalName, len(plan))
+		for i, step := range plan {
+			fmt.Printf("  %d. %s — %s\n", i+1, step.Capability, step.Reason)
+		}
+	} else {
+		appendEvent(ctx, "plan_revised", "", map[string]interface{}{"steps": plan, "reason": "replan from prior run"})
+		fmt.Printf("Replan for %s in %s (%d steps):\n", goalName, ctx.RunID, len(plan))
+		for i, step := range plan {
+			fmt.Printf("  %d. %s — %s\n", i+1, step.Capability, step.Reason)
+		}
 	}
 	resources := map[string]string{}
 	for k := range cfg.Resources {
@@ -586,6 +607,15 @@ func runPlan(root string, cfg Config, configHash, goalName string, plan []PlanSt
 	goal := cfg.Goals[goalName]
 	executedCaps := map[string]bool{}
 	stepNum := 0
+	if resuming {
+		executedCaps = executedCapabilitiesFromEvents(ctx.RunDir)
+		events, _ := readEvents(ctx.RunDir)
+		for _, ev := range events {
+			if ev.Type == "action_completed" || ev.Type == "action_failed" {
+				stepNum++
+			}
+		}
+	}
 	failureCount := 0
 	lastPlanCaps := planCapabilities(plan)
 	for {
@@ -685,6 +715,8 @@ func runPlan(root string, cfg Config, configHash, goalName string, plan []PlanSt
 	reason := "goal evidence requirements satisfied"
 	if !satisfied {
 		reason = "goal evidence requirements not fully satisfied"
+	} else {
+		recordGoalAttestation(ctx, goal)
 	}
 	if err := writeSummary(ctx, goalName, satisfied, reason, missing); err != nil {
 		return err
@@ -698,19 +730,51 @@ func cmdEvidence(args []string) error {
 	if len(args) != 1 {
 		return errors.New("usage: rp evidence GOAL")
 	}
+	goalName := args[0]
+	_, cfg, _, err := loadProject()
+	if err != nil {
+		return err
+	}
+	goal, ok := cfg.Goals[goalName]
+	if !ok {
+		return fmt.Errorf("goal %q not found", goalName)
+	}
 	runDir, err := latestRunDir()
 	if err != nil {
 		return err
 	}
-	events, err := readEvents(runDir)
-	if err != nil {
-		return err
+	summary := loadRunSummary(runDir)
+	if g, _ := summary["goal"].(string); g != "" && g != goalName {
+		fmt.Printf("note: latest run goal is %q, not %q\n", g, goalName)
 	}
-	for _, ev := range events {
-		if ev.Type == "assertion_recorded" || ev.Type == "observation_recorded" || ev.Type == "evidence_recorded" {
-			b, _ := json.MarshalIndent(ev, "", "  ")
-			fmt.Println(string(b))
+	satisfied := goalSatisfied(runDir, goal)
+	fmt.Printf("Goal %s (run %s)\n", goalName, filepath.Base(runDir))
+	fmt.Printf("Satisfied: %v\n\n", satisfied)
+	fmt.Println("Required evidence:")
+	assertions, _ := assertionsFromRun(runDir)
+	effective := effectiveAssertions(assertions)
+	for _, req := range goal.RequiresEvidence {
+		status := "missing"
+		detail := ""
+		for _, as := range effective {
+			if as.Subject == req.Subject && as.Predicate == req.Predicate &&
+				confidenceAtLeast(as.Confidence, req.MinConfidence) &&
+				sourceAllowed(as.EvidenceSource, req.AnySourceType) &&
+				sourceMaySatisfyRequiredEvidence(cfg, as.EvidenceSource) {
+				status = "ok"
+				detail = fmt.Sprintf("%s via %s (%s)", as.Confidence, as.EvidenceSource, as.ID)
+				break
+			}
 		}
+		fmt.Printf("  [%s] %s.%s >= %s", status, req.Subject, req.Predicate, req.MinConfidence)
+		if detail != "" {
+			fmt.Printf(" — %s", detail)
+		}
+		fmt.Println()
+	}
+	missing := missingEvidenceWithConfig(runDir, goal, cfg)
+	if len(missing) > 0 {
+		fmt.Printf("\nMissing requirements: %d\n", len(missing))
 	}
 	return nil
 }
@@ -950,6 +1014,8 @@ func cmdReplay(args []string) error {
 			fmt.Printf("[%s] goal gap: %v missing requirement(s)\n", shortTime(ev.Time), ev.Data["missing_count"])
 		case "goal_satisfied":
 			fmt.Printf("[%s] goal satisfied=%v\n", shortTime(ev.Time), ev.Data["satisfied"])
+		case "attestation_recorded":
+			fmt.Printf("[%s] attestation %v (%d assertions)\n", shortTime(ev.Time), ev.Data["id"], lenSlice(ev.Data["assertion_ids"]))
 		case "plan_invalidated":
 			fmt.Printf("[%s] plan invalidated: %v\n", shortTime(ev.Time), ev.Data["reason"])
 		case "run_stopped":
@@ -973,34 +1039,83 @@ func cmdReplay(args []string) error {
 }
 
 func cmdReplan(args []string) error {
-	if len(args) != 1 {
-		return errors.New("usage: rp replan RUN_ID")
+	fs := flag.NewFlagSet("replan", flag.ContinueOnError)
+	stepMode := fs.Bool("step", false, "confirm every step")
+	yes := fs.Bool("yes", false, "approve writes and continue execution in the prior run")
+	if err := fs.Parse(normalizeFlagArgs(args, map[string]bool{}, map[string]bool{"step": true, "yes": true})); err != nil {
+		return err
 	}
-	summaryPath := filepath.Join(".rp", "runs", args[0], "summary.json")
-	b, err := os.ReadFile(summaryPath)
+	if fs.NArg() != 1 {
+		return errors.New("usage: rp replan RUN_ID [--yes] [--step]")
+	}
+	runID := fs.Arg(0)
+	root, cfg, configHash, err := loadProject()
 	if err != nil {
 		return err
 	}
-	var summary map[string]interface{}
-	if err := json.Unmarshal(b, &summary); err != nil {
-		return err
-	}
+	summary := loadRunSummary(filepath.Join(".rp", "runs", runID))
 	goal, _ := summary["goal"].(string)
 	if goal == "" {
 		return errors.New("run summary has no goal")
 	}
-	return cmdPlan([]string{"--explain", goal})
-}
-
-func cmdRerun(args []string) error {
-	if len(args) != 1 {
-		return errors.New("usage: rp rerun RUN_ID")
+	if _, ok := cfg.Goals[goal]; !ok {
+		return fmt.Errorf("goal %q from run is not in current config", goal)
 	}
-	goal, err := goalFromRun(args[0])
+	missing := missingEvidenceWithConfig(filepath.Join(".rp", "runs", runID), cfg.Goals[goal], cfg)
+	fmt.Printf("Prior run %s goal=%s satisfied=%v\n", runID, goal, len(missing) == 0)
+	if len(missing) > 0 {
+		fmt.Println("Missing evidence:")
+		for _, req := range missing {
+			fmt.Printf("  - %s.%s >= %s\n", req.Subject, req.Predicate, req.MinConfidence)
+		}
+		fmt.Println()
+	}
+	plan, err := buildPlan(cfg, goal)
 	if err != nil {
 		return err
 	}
-	return cmdAchieve([]string{goal})
+	fmt.Printf("Revised plan (%d steps):\n", len(plan))
+	for i, step := range plan {
+		fmt.Printf("  %d. %s — %s\n", i+1, step.Capability, step.Reason)
+		if *yes {
+			fmt.Printf("     inputs: %v\n", step.Inputs)
+		}
+	}
+	if !*yes {
+		fmt.Println("\nUse --yes to continue execution in the prior run.")
+		return nil
+	}
+	repairEnabled, repairMax := autoRepairSettings(cfg, false, 0)
+	return runPlan(root, cfg, configHash, goal, plan, "", false, *stepMode, true, true, repairEnabled, repairMax, runID)
+}
+
+func cmdRerun(args []string) error {
+	fs := flag.NewFlagSet("rerun", flag.ContinueOnError)
+	stepMode := fs.Bool("step", false, "confirm every step")
+	yes := fs.Bool("yes", false, "approve required filesystem writes")
+	autoRepair := fs.Bool("auto-repair", false, "retry failed steps by replanning")
+	maxAttempts := fs.Int("max-attempts", 0, "max failure retries when auto-repair is enabled (0 uses policy default)")
+	if err := fs.Parse(normalizeFlagArgs(args, map[string]bool{"max-attempts": true}, map[string]bool{"step": true, "yes": true, "auto-repair": true})); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		return errors.New("usage: rp rerun RUN_ID [--yes] [--step] [--auto-repair] [--max-attempts N]")
+	}
+	runID := fs.Arg(0)
+	goal, err := goalFromRun(runID)
+	if err != nil {
+		return err
+	}
+	root, cfg, configHash, err := loadProject()
+	if err != nil {
+		return err
+	}
+	plan, err := buildPlan(cfg, goal)
+	if err != nil {
+		return err
+	}
+	repairEnabled, repairMax := autoRepairSettings(cfg, *autoRepair, *maxAttempts)
+	return runPlan(root, cfg, configHash, goal, plan, "", false, *stepMode, *yes, true, repairEnabled, repairMax, "")
 }
 
 func cmdExec(args []string) error {
@@ -1026,7 +1141,7 @@ func cmdExec(args []string) error {
 		return fmt.Errorf("saved plan %s was built for config %s, current config is %s; replan before exec", plan.ID, shortHash(plan.ConfigHash), shortHash(configHash))
 	}
 	repairEnabled, repairMax := autoRepairSettings(cfg, false, 0)
-	return runPlan(root, cfg, configHash, plan.Goal, plan.Steps, plan.ID, *dryRun, *stepMode, *yes, false, repairEnabled, repairMax)
+	return runPlan(root, cfg, configHash, plan.Goal, plan.Steps, plan.ID, *dryRun, *stepMode, *yes, false, repairEnabled, repairMax, "")
 }
 
 func loadProject() (string, Config, string, error) {
@@ -1389,6 +1504,14 @@ func sameCapabilities(a, b []string) bool {
 }
 
 func planStepCount(raw interface{}) int {
+	items, ok := raw.([]interface{})
+	if !ok {
+		return 0
+	}
+	return len(items)
+}
+
+func lenSlice(raw interface{}) int {
 	items, ok := raw.([]interface{})
 	if !ok {
 		return 0
@@ -1918,6 +2041,94 @@ func newRun(root, configHash, policyHash string) (RunContext, error) {
 		return RunContext{}, err
 	}
 	return RunContext{Root: root, RPDir: filepath.Join(root, ".rp"), RunID: runID, RunDir: runDir, Artifacts: artifacts, ConfigHash: configHash, PolicyHash: policyHash, Events: f}, nil
+}
+
+func openRun(root, runID string) (RunContext, error) {
+	runDir := filepath.Join(root, ".rp", "runs", runID)
+	summary := loadRunSummary(runDir)
+	configHash, _ := summary["config_hash"].(string)
+	policyHash, _ := summary["policy_hash"].(string)
+	if configHash == "" {
+		return RunContext{}, fmt.Errorf("run %s has no config_hash in summary", runID)
+	}
+	artifacts := filepath.Join(runDir, "artifacts")
+	if err := os.MkdirAll(artifacts, 0755); err != nil {
+		return RunContext{}, err
+	}
+	f, err := os.OpenFile(filepath.Join(runDir, "events.jsonl"), os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		return RunContext{}, err
+	}
+	return RunContext{Root: root, RPDir: filepath.Join(root, ".rp"), RunID: runID, RunDir: runDir, Artifacts: artifacts, ConfigHash: configHash, PolicyHash: policyHash, Events: f}, nil
+}
+
+func loadRunSummary(runDir string) map[string]interface{} {
+	summary := map[string]interface{}{}
+	b, err := os.ReadFile(filepath.Join(runDir, "summary.json"))
+	if err != nil {
+		return summary
+	}
+	_ = json.Unmarshal(b, &summary)
+	return summary
+}
+
+func executedCapabilitiesFromEvents(runDir string) map[string]bool {
+	events, err := readEvents(runDir)
+	if err != nil {
+		return map[string]bool{}
+	}
+	capByAction := map[string]string{}
+	executed := map[string]bool{}
+	for _, ev := range events {
+		if ev.Type == "action_started" {
+			if cap, ok := ev.Data["capability"].(string); ok {
+				capByAction[ev.ActionID] = cap
+			}
+		}
+		if ev.Type == "action_completed" {
+			if cap, ok := capByAction[ev.ActionID]; ok {
+				executed[cap] = true
+			}
+		}
+	}
+	return executed
+}
+
+func recordGoalAttestation(ctx RunContext, goal Goal) {
+	assertions, err := assertionsFromRun(ctx.RunDir)
+	if err != nil {
+		return
+	}
+	effective := effectiveAssertions(assertions)
+	var assertionIDs, evidenceIDs []string
+	seenEvidence := map[string]bool{}
+	for _, req := range goal.RequiresEvidence {
+		for _, as := range effective {
+			if as.Subject != req.Subject || as.Predicate != req.Predicate {
+				continue
+			}
+			if !confidenceAtLeast(as.Confidence, req.MinConfidence) {
+				continue
+			}
+			assertionIDs = append(assertionIDs, as.ID)
+			if as.EvidenceID != "" && !seenEvidence[as.EvidenceID] {
+				evidenceIDs = append(evidenceIDs, as.EvidenceID)
+				seenEvidence[as.EvidenceID] = true
+			}
+			break
+		}
+	}
+	if len(assertionIDs) == 0 {
+		return
+	}
+	appendEvent(ctx, "attestation_recorded", "", map[string]interface{}{
+		"id":            "att-goal-" + ctx.RunID,
+		"assertion_ids": assertionIDs,
+		"evidence_ids":  evidenceIDs,
+		"config_hash":   ctx.ConfigHash,
+		"policy_hash":   ctx.PolicyHash,
+		"run_id":        ctx.RunID,
+	})
 }
 
 func newManualRun(root, configHash, policyHash, reason string) (RunContext, error) {

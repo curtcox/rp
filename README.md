@@ -40,11 +40,14 @@ computes a canonical JSON config hash, plans backward from goals with just-in-ti
 replanning during `achieve`, executes command capabilities serially with
 execution-time precondition checks, supports `--auto-repair` retries governed by
 policy `execution.auto_repair`, records assertion supersession when evidence is
-corrected, writes artifacts under
+corrected, writes a goal attestation bundle when evidence requirements are met,
+writes artifacts under
 `.rp/runs/<run-id>/artifacts`, records append-only JSONL events (including
 `action_failed` for non-zero exits when `always_record_result` is set), and
 explains assertions from the latest run. Use `rp replay RUN_ID` for a narrative
 reconstruction of a run; `rp audit RUN_ID` prints the raw event timeline.
+`rp replan RUN_ID --yes` continues execution in the prior run; `rp rerun RUN_ID`
+starts a fresh run for the same goal.
 
 ## Tutorial: bugfix patch
 

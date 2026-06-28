@@ -912,3 +912,130 @@ func TestReplayPrintsNarrative(t *testing.T) {
 		t.Fatalf("unexpected replay output: %q", out)
 	}
 }
+
+func TestEvidenceReportShowsRequirementStatus(t *testing.T) {
+	dir := t.TempDir()
+	runDir := filepath.Join(dir, ".rp", "runs", "run-evidence")
+	if err := os.MkdirAll(runDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	events := []byte(`{"type":"assertion_recorded","data":{"id":"as-1","subject":"patch","predicate":"applies_cleanly","confidence":"observed","evidence_id":"ev-1","evidence_source":"process_exit","action_id":"act-1"}}
+{"type":"assertion_recorded","data":{"id":"as-2","subject":"patched_repo","predicate":"tests_pass","confidence":"observed","evidence_id":"ev-2","evidence_source":"process_exit","action_id":"act-2"}}
+`)
+	if err := os.WriteFile(filepath.Join(runDir, "events.jsonl"), events, 0644); err != nil {
+		t.Fatal(err)
+	}
+	summary := []byte(`{"goal":"bugfix_patch","satisfied":true,"reason":"goal evidence requirements satisfied"}
+`)
+	if err := os.WriteFile(filepath.Join(runDir, "summary.json"), summary, 0644); err != nil {
+		t.Fatal(err)
+	}
+	planner := []byte(`version: rp.dev/v0.1
+goals:
+  bugfix_patch:
+    requires_evidence:
+      - subject: patch
+        predicate: applies_cleanly
+        min_confidence: observed
+      - subject: patched_repo
+        predicate: tests_pass
+        min_confidence: observed
+policies:
+  local_safe:
+    permissions: {}
+defaults:
+  policy: local_safe
+`)
+	oldwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := os.Chdir(oldwd); err != nil {
+			t.Fatal(err)
+		}
+	}()
+	if err := os.MkdirAll(filepath.Join(dir, ".rp"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".rp", "planner.yaml"), planner, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	oldStdout := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stdout = w
+	err = cmdEvidence([]string{"bugfix_patch"})
+	w.Close()
+	os.Stdout = oldStdout
+	if err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	_, _ = buf.ReadFrom(r)
+	out := buf.String()
+	if !strings.Contains(out, "Satisfied: true") || !strings.Contains(out, "[ok] patch.applies_cleanly") || !strings.Contains(out, "[ok] patched_repo.tests_pass") {
+		t.Fatalf("unexpected evidence output: %q", out)
+	}
+}
+
+func TestExecutedCapabilitiesFromEvents(t *testing.T) {
+	runDir := t.TempDir()
+	events := []byte(`{"type":"action_started","action_id":"step-01-observe","data":{"capability":"observe_git_status"}}
+{"type":"action_completed","action_id":"step-01-observe","data":{"exit_code":0}}
+{"type":"action_started","action_id":"step-02-fail","data":{"capability":"run_tests"}}
+{"type":"action_failed","action_id":"step-02-fail","data":{"exit_code":1}}
+`)
+	if err := os.WriteFile(filepath.Join(runDir, "events.jsonl"), events, 0644); err != nil {
+		t.Fatal(err)
+	}
+	executed := executedCapabilitiesFromEvents(runDir)
+	if !executed["observe_git_status"] {
+		t.Fatal("observe_git_status should count as executed")
+	}
+	if executed["run_tests"] {
+		t.Fatal("failed capability should not count as executed")
+	}
+}
+
+func TestRecordGoalAttestation(t *testing.T) {
+	dir := t.TempDir()
+	ctx, err := newRun(dir, "cfg-hash", "pol-hash")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ctx.Events.Close()
+	goal := Goal{RequiresEvidence: []Requirement{
+		{Subject: "patch", Predicate: "applies_cleanly", MinConfidence: "observed"},
+	}}
+	events := []byte(`{"type":"assertion_recorded","data":{"id":"as-1","subject":"patch","predicate":"applies_cleanly","confidence":"observed","evidence_id":"ev-1","evidence_source":"process_exit","action_id":"act-1"}}
+`)
+	if err := os.WriteFile(filepath.Join(ctx.RunDir, "events.jsonl"), events, 0644); err != nil {
+		t.Fatal(err)
+	}
+	ctx.Events.Close()
+	f, err := os.OpenFile(filepath.Join(ctx.RunDir, "events.jsonl"), os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx.Events = f
+	recordGoalAttestation(ctx, goal)
+	all, err := readEvents(ctx.RunDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, ev := range all {
+		if ev.Type == "attestation_recorded" && ev.Data["id"] == "att-goal-"+ctx.RunID {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("expected goal attestation event")
+	}
+}
