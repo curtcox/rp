@@ -117,7 +117,8 @@ func TestExampleProjectBugfixAchieve(t *testing.T) {
 	if err := exec.Command("git", "add", "-A").Run(); err != nil {
 		t.Fatal(err)
 	}
-	if err := exec.Command("git", "commit", "-m", "initial").Run(); err != nil {
+	// CI runners have no global git identity; commit must supply one locally.
+	if err := exec.Command("git", "-c", "user.email=rp-test@example.com", "-c", "user.name=rp test", "commit", "-m", "initial").Run(); err != nil {
 		t.Fatal(err)
 	}
 	if err := run([]string{"achieve", "bugfix_patch", "--yes"}); err != nil {
