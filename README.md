@@ -37,7 +37,8 @@ The runtime loads project-local `.rp/` YAML, resolves local imports, validates
 declared fields (unknown keys are rejected unless prefixed with `x-`), merges an
 optional user policy from `~/.config/rp/policy.yaml` (most-restrictive wins),
 computes a canonical JSON config hash, plans backward from goals with just-in-time
-replanning during `achieve`, executes command capabilities serially with
+replanning during `achieve`, validates GitRepo resources are independent git
+repositories before execution, executes command capabilities serially with
 execution-time precondition checks, supports `--auto-repair` retries governed by
 policy `execution.auto_repair`, records assertion supersession when evidence is
 corrected, writes a goal attestation bundle when evidence requirements are met,
@@ -72,6 +73,9 @@ go run ../cmd/rp evidence bugfix_patch
 go run ../cmd/rp audit "$(ls -1 .rp/runs | tail -1)"
 go run ../cmd/rp replay "$(ls -1 .rp/runs | tail -1)"
 ```
+
+The project must have its own `git init` in `example-project/` so Git commands target
+that directory rather than a parent repository.
 
 After a successful run you should see:
 

@@ -18,183 +18,37 @@ import (
 	"strings"
 	"time"
 
+	"rp/internal/gitrepo"
+	"rp/internal/model"
+
 	"gopkg.in/yaml.v3"
 )
 
-const version = "rp.dev/v0.1"
+const version = model.Version
 
-var confidenceRank = map[string]int{
-	"unsupported":              0,
-	"claimed":                  1,
-	"observed":                 2,
-	"attested":                 3,
-	"reproduced":               4,
-	"independently_reproduced": 5,
-}
-
-type Config struct {
-	Version      string                 `yaml:"version" json:"version"`
-	Imports      []string               `yaml:"imports,omitempty" json:"imports,omitempty"`
-	Resources    map[string]Resource    `yaml:"resources,omitempty" json:"resources,omitempty"`
-	Capabilities map[string]Capability  `yaml:"capabilities,omitempty" json:"capabilities,omitempty"`
-	Policies     map[string]Policy      `yaml:"policies,omitempty" json:"policies,omitempty"`
-	Goals        map[string]Goal        `yaml:"goals,omitempty" json:"goals,omitempty"`
-	Defaults     map[string]string      `yaml:"defaults,omitempty" json:"defaults,omitempty"`
-	X            map[string]interface{} `yaml:",inline" json:"-"`
-}
-
-type Resource struct {
-	Type         string        `yaml:"type" json:"type"`
-	Realizations []Realization `yaml:"realizations,omitempty" json:"realizations,omitempty"`
-}
-
-type Realization struct {
-	ID        string                 `yaml:"id" json:"id"`
-	Kind      string                 `yaml:"kind" json:"kind"`
-	URI       string                 `yaml:"uri" json:"uri"`
-	MediaType string                 `yaml:"media_type,omitempty" json:"media_type,omitempty"`
-	Hash      string                 `yaml:"hash,omitempty" json:"hash,omitempty"`
-	Metadata  map[string]interface{} `yaml:"metadata,omitempty" json:"metadata,omitempty"`
-}
-
-type Capability struct {
-	Purpose            string                 `yaml:"purpose" json:"purpose"`
-	Kind               string                 `yaml:"kind" json:"kind"`
-	Inputs             map[string]InputSpec   `yaml:"inputs,omitempty" json:"inputs,omitempty"`
-	Outputs            map[string]OutputSpec  `yaml:"outputs,omitempty" json:"outputs,omitempty"`
-	Preconditions      []Requirement          `yaml:"preconditions,omitempty" json:"preconditions,omitempty"`
-	Command            CommandSpec            `yaml:"command,omitempty" json:"command,omitempty"`
-	Approval           map[string]interface{} `yaml:"approval,omitempty" json:"approval,omitempty"`
-	AlwaysRecordResult bool                   `yaml:"always_record_result,omitempty" json:"always_record_result,omitempty"`
-	Effects            EffectSpec             `yaml:"effects,omitempty" json:"effects,omitempty"`
-	Nondeterminism     []string               `yaml:"nondeterminism,omitempty" json:"nondeterminism,omitempty"`
-	Idempotence        string                 `yaml:"idempotence,omitempty" json:"idempotence,omitempty"`
-	Cost               map[string]interface{} `yaml:"cost,omitempty" json:"cost,omitempty"`
-}
-
-type InputSpec struct {
-	Type        string        `yaml:"type" json:"type"`
-	Realization Realization   `yaml:"realization,omitempty" json:"realization,omitempty"`
-	Requires    []Requirement `yaml:"requires,omitempty" json:"requires,omitempty"`
-}
-
-type Requirement struct {
-	Subject       string   `yaml:"subject,omitempty" json:"subject,omitempty"`
-	Predicate     string   `yaml:"predicate" json:"predicate"`
-	MinConfidence string   `yaml:"min_confidence" json:"min_confidence"`
-	AnySourceType []string `yaml:"any_source_type,omitempty" json:"any_source_type,omitempty"`
-}
-
-type OutputSpec struct {
-	Type                string          `yaml:"type" json:"type"`
-	RequiredRealization Realization     `yaml:"required_realization,omitempty" json:"required_realization,omitempty"`
-	Realization         Realization     `yaml:"realization,omitempty" json:"realization,omitempty"`
-	Assertions          []AssertionSpec `yaml:"assertions,omitempty" json:"assertions,omitempty"`
-}
-
-type AssertionSpec struct {
-	Subject        string                 `yaml:"subject" json:"subject"`
-	Predicate      string                 `yaml:"predicate" json:"predicate"`
-	Object         string                 `yaml:"object,omitempty" json:"object,omitempty"`
-	Confidence     string                 `yaml:"confidence" json:"confidence"`
-	When           map[string]interface{} `yaml:"when,omitempty" json:"when,omitempty"`
-	EvidenceSource string                 `yaml:"evidence_source,omitempty" json:"evidence_source,omitempty"`
-}
-
-type CommandSpec struct {
-	CWD    string     `yaml:"cwd,omitempty" json:"cwd,omitempty"`
-	Argv   []string   `yaml:"argv,omitempty" json:"argv,omitempty"`
-	Stdout StreamSpec `yaml:"stdout,omitempty" json:"stdout,omitempty"`
-	Stderr StreamSpec `yaml:"stderr,omitempty" json:"stderr,omitempty"`
-}
-
-type StreamSpec struct {
-	SaveAs         SaveAsSpec `yaml:"save_as,omitempty" json:"save_as,omitempty"`
-	SaveAsArtifact string     `yaml:"save_as_artifact,omitempty" json:"save_as_artifact,omitempty"`
-	MediaType      string     `yaml:"media_type,omitempty" json:"media_type,omitempty"`
-}
-
-type SaveAsSpec struct {
-	Resource     string `yaml:"resource,omitempty" json:"resource,omitempty"`
-	ArtifactPath string `yaml:"artifact_path,omitempty" json:"artifact_path,omitempty"`
-	MediaType    string `yaml:"media_type,omitempty" json:"media_type,omitempty"`
-}
-
-type EffectSpec struct {
-	External            string                 `yaml:"external,omitempty" json:"external,omitempty"`
-	Planner             string                 `yaml:"planner,omitempty" json:"planner,omitempty"`
-	Filesystem          map[string][]string    `yaml:"filesystem,omitempty" json:"filesystem,omitempty"`
-	Network             map[string]interface{} `yaml:"network,omitempty" json:"network,omitempty"`
-	ExternalSideEffects map[string]interface{} `yaml:"external_side_effects,omitempty" json:"external_side_effects,omitempty"`
-}
-
-type Policy struct {
-	Description string                 `yaml:"description,omitempty" json:"description,omitempty"`
-	Permissions map[string]interface{} `yaml:"permissions,omitempty" json:"permissions,omitempty"`
-	Environment struct {
-		Inherit bool     `yaml:"inherit" json:"inherit"`
-		Allow   []string `yaml:"allow,omitempty" json:"allow,omitempty"`
-	} `yaml:"environment,omitempty" json:"environment,omitempty"`
-	Evidence  map[string]interface{} `yaml:"evidence,omitempty" json:"evidence,omitempty"`
-	Hashing   map[string]interface{} `yaml:"hashing,omitempty" json:"hashing,omitempty"`
-	Execution map[string]interface{} `yaml:"execution,omitempty" json:"execution,omitempty"`
-	MaxCost   map[string]interface{} `yaml:"max_cost,omitempty" json:"max_cost,omitempty"`
-}
-
-type Goal struct {
-	Description      string                 `yaml:"description,omitempty" json:"description,omitempty"`
-	Given            map[string]string      `yaml:"given,omitempty" json:"given,omitempty"`
-	Produce          map[string]OutputSpec  `yaml:"produce,omitempty" json:"produce,omitempty"`
-	RequiresEvidence []Requirement          `yaml:"requires_evidence,omitempty" json:"requires_evidence,omitempty"`
-	Constraints      map[string]interface{} `yaml:"constraints,omitempty" json:"constraints,omitempty"`
-}
-
-type PlanStep struct {
-	ID         string            `json:"id"`
-	Capability string            `json:"capability"`
-	Reason     string            `json:"reason"`
-	Inputs     map[string]string `json:"inputs"`
-}
-
-type SavedPlan struct {
-	ID         string     `json:"id"`
-	Goal       string     `json:"goal"`
-	ConfigHash string     `json:"config_hash"`
-	PolicyHash string     `json:"policy_hash"`
-	CreatedAt  string     `json:"created_at"`
-	Steps      []PlanStep `json:"steps"`
-}
-
-type Event struct {
-	Type     string                 `json:"type"`
-	Time     string                 `json:"time"`
-	RunID    string                 `json:"run_id,omitempty"`
-	ActionID string                 `json:"action_id,omitempty"`
-	Data     map[string]interface{} `json:"data,omitempty"`
-}
-
-type RunContext struct {
-	Root       string
-	RPDir      string
-	RunID      string
-	RunDir     string
-	Artifacts  string
-	ConfigHash string
-	PolicyHash string
-	Events     *os.File
-}
-
-type AssertionRecord struct {
-	ID             string `json:"id"`
-	Subject        string `json:"subject"`
-	Predicate      string `json:"predicate"`
-	Object         string `json:"object,omitempty"`
-	Confidence     string `json:"confidence"`
-	EvidenceID     string `json:"evidence_id"`
-	EvidenceSource string `json:"evidence_source"`
-	ActionID       string `json:"action_id"`
-	Supersedes     string `json:"supersedes,omitempty"`
-}
+type (
+	Config          = model.Config
+	Resource        = model.Resource
+	Realization     = model.Realization
+	Capability      = model.Capability
+	InputSpec       = model.InputSpec
+	Requirement     = model.Requirement
+	OutputSpec      = model.OutputSpec
+	AssertionSpec   = model.AssertionSpec
+	CommandSpec     = model.CommandSpec
+	StreamSpec      = model.StreamSpec
+	SaveAsSpec      = model.SaveAsSpec
+	EffectSpec      = model.EffectSpec
+	Policy          = model.Policy
+	Goal            = model.Goal
+	PlanStep        = model.PlanStep
+	SavedPlan       = model.SavedPlan
+	Event           = model.Event
+	RunContext      = model.RunContext
+	AssertionRecord = model.AssertionRecord
+	ProduceRecord   = model.ProduceRecord
+	PlanEffectSummary = model.PlanEffectSummary
+)
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {
@@ -571,6 +425,11 @@ func cmdAchieve(args []string) error {
 		return err
 	}
 	repairEnabled, repairMax := autoRepairSettings(cfg, *autoRepair, *maxAttempts)
+	if !*dryRun {
+		if err := gitrepo.ValidateGoalGitRepos(root, cfg, cfg.Goals[fs.Arg(0)]); err != nil {
+			return err
+		}
+	}
 	return runPlan(root, cfg, configHash, fs.Arg(0), plan, "", *dryRun, *stepMode, *yes, true, repairEnabled, repairMax, "")
 }
 
@@ -601,6 +460,7 @@ func runPlan(root string, cfg Config, configHash, goalName string, plan []PlanSt
 		}
 	}
 	defer ctx.Events.Close()
+	goal := cfg.Goals[goalName]
 	if !resuming {
 		startData := map[string]interface{}{"goal": goalName, "config_hash": configHash}
 		if planID != "" {
@@ -617,6 +477,11 @@ func runPlan(root string, cfg Config, configHash, goalName string, plan []PlanSt
 			fmt.Printf("  %d. %s — %s\n", i+1, step.Capability, step.Reason)
 		}
 		printEffectSummary(cfg, plan)
+		if err := gitrepo.ValidateGoalGitRepos(root, cfg, goal); err != nil {
+			appendEvent(ctx, "run_stopped", "", map[string]interface{}{"reason": err.Error()})
+			writeSummary(ctx, goalName, false, err.Error(), missingEvidenceWithConfig(ctx.RunDir, goal, cfg), missingProduce(ctx.RunDir, goal))
+			return err
+		}
 	} else {
 		appendEvent(ctx, "plan_revised", "", map[string]interface{}{"steps": plan, "reason": "replan from prior run"})
 		fmt.Printf("Replan for %s in %s (%d steps):\n", goalName, ctx.RunID, len(plan))
@@ -628,7 +493,6 @@ func runPlan(root string, cfg Config, configHash, goalName string, plan []PlanSt
 	for k := range cfg.Resources {
 		resources[k] = k
 	}
-	goal := cfg.Goals[goalName]
 	executedCaps := map[string]bool{}
 	stepNum := 0
 	if resuming {
@@ -835,7 +699,7 @@ func cmdEvidence(args []string) error {
 		detail := ""
 		for _, as := range effective {
 			if as.Subject == req.Subject && as.Predicate == req.Predicate &&
-				confidenceAtLeast(as.Confidence, req.MinConfidence) &&
+				model.ConfidenceAtLeast(as.Confidence, req.MinConfidence) &&
 				sourceAllowed(as.EvidenceSource, req.AnySourceType) &&
 				sourceMaySatisfyRequiredEvidence(cfg, as.EvidenceSource) {
 				status = "ok"
@@ -874,7 +738,7 @@ func cmdWhy(args []string) error {
 	}
 	best := AssertionRecord{Confidence: "unsupported"}
 	for _, a := range effectiveAssertions(assertions) {
-		if a.Subject == subject && a.Predicate == predicate && confidenceAtLeast(a.Confidence, best.Confidence) {
+		if a.Subject == subject && a.Predicate == predicate && model.ConfidenceAtLeast(a.Confidence, best.Confidence) {
 			best = a
 		}
 	}
@@ -1593,7 +1457,7 @@ func checkStepPreconditions(runDir string, cfg Config, step PlanStep) error {
 func assertionRequirementMet(assertions []AssertionRecord, req Requirement, subject string, cfg Config) bool {
 	for _, as := range assertions {
 		if as.Subject == subject && as.Predicate == req.Predicate &&
-			confidenceAtLeast(as.Confidence, req.MinConfidence) &&
+			model.ConfidenceAtLeast(as.Confidence, req.MinConfidence) &&
 			sourceAllowed(as.EvidenceSource, req.AnySourceType) &&
 			sourceMaySatisfyRequiredEvidence(cfg, as.EvidenceSource) {
 			return true
@@ -2256,7 +2120,7 @@ func recordGoalAttestation(ctx RunContext, cfg Config, goal Goal) {
 			if as.Subject != req.Subject || as.Predicate != req.Predicate {
 				continue
 			}
-			if !confidenceAtLeast(as.Confidence, req.MinConfidence) {
+			if !model.ConfidenceAtLeast(as.Confidence, req.MinConfidence) {
 				continue
 			}
 			assertionIDs = append(assertionIDs, as.ID)
@@ -2374,13 +2238,6 @@ func goalSatisfied(runDir string, goal Goal, cfg Config) bool {
 	return len(missingEvidenceWithConfig(runDir, goal, cfg)) == 0 && len(missingProduce(runDir, goal)) == 0
 }
 
-type ProduceRecord struct {
-	Resource  string
-	Artifact  string
-	MediaType string
-	Kind      string
-}
-
 func realizationsFromRun(runDir string) map[string]ProduceRecord {
 	events, err := readEvents(runDir)
 	if err != nil {
@@ -2459,7 +2316,7 @@ func missingEvidenceWithConfig(runDir string, goal Goal, cfg Config) []Requireme
 	for _, req := range goal.RequiresEvidence {
 		ok := false
 		for _, as := range effective {
-			if as.Subject == req.Subject && as.Predicate == req.Predicate && confidenceAtLeast(as.Confidence, req.MinConfidence) && sourceAllowed(as.EvidenceSource, req.AnySourceType) && sourceMaySatisfyRequiredEvidence(cfg, as.EvidenceSource) {
+			if as.Subject == req.Subject && as.Predicate == req.Predicate && model.ConfidenceAtLeast(as.Confidence, req.MinConfidence) && sourceAllowed(as.EvidenceSource, req.AnySourceType) && sourceMaySatisfyRequiredEvidence(cfg, as.EvidenceSource) {
 				ok = true
 			}
 		}
@@ -2576,7 +2433,7 @@ func readEvents(runDir string) ([]Event, error) {
 }
 
 func appendManualAssertion(subject, predicate, object, confidence, source, note, actionID string) error {
-	if !knownConfidence(confidence) {
+	if !model.KnownConfidence(confidence) {
 		return fmt.Errorf("unknown confidence %q", confidence)
 	}
 	root, cfg, configHash, err := loadProject()
@@ -2637,11 +2494,6 @@ func predicatePart(predicate string) string {
 		return "attested"
 	}
 	return predicate
-}
-
-func knownConfidence(confidence string) bool {
-	_, ok := confidenceRank[confidence]
-	return ok
 }
 
 func eventMatches(ev Event, query string) bool {
@@ -3216,13 +3068,6 @@ func resolveSubject(subject string, step PlanStep) string {
 	return subject
 }
 
-type PlanEffectSummary struct {
-	External            []string `json:"external,omitempty"`
-	ExternalSideEffects []string `json:"external_side_effects,omitempty"`
-	FilesystemWrites    []string `json:"filesystem_writes,omitempty"`
-	NeedsApproval       []string `json:"needs_approval,omitempty"`
-}
-
 func summarizePlanEffects(cfg Config, plan []PlanStep) PlanEffectSummary {
 	var summary PlanEffectSummary
 	seenWrites := map[string]bool{}
@@ -3423,7 +3268,7 @@ func activePolicy(cfg Config) Policy {
 
 func capConfidenceByPolicy(cfg Config, sourceType, confidence string) string {
 	maxConfidence := policySourceMaxConfidence(activePolicy(cfg), sourceType)
-	if maxConfidence == "" || confidenceAtLeast(maxConfidence, confidence) {
+	if maxConfidence == "" || model.ConfidenceAtLeast(maxConfidence, confidence) {
 		return confidence
 	}
 	return maxConfidence
@@ -3432,7 +3277,7 @@ func capConfidenceByPolicy(cfg Config, sourceType, confidence string) string {
 func policySourceMaxConfidence(pol Policy, sourceType string) string {
 	for _, rule := range policyEvidenceRules(pol, "source_limits") {
 		if stringField(rule, "source_type") == sourceType {
-			if max := stringField(rule, "max_confidence"); knownConfidence(max) {
+			if max := stringField(rule, "max_confidence"); model.KnownConfidence(max) {
 				return max
 			}
 		}
@@ -3585,10 +3430,6 @@ func shortHash(s string) string {
 		return s
 	}
 	return s[:12]
-}
-
-func confidenceAtLeast(got, min string) bool {
-	return confidenceRank[got] >= confidenceRank[min]
 }
 
 func sourceAllowed(got string, allowed []string) bool {
