@@ -276,3 +276,97 @@ defaults:
 		t.Fatal("expected trace matching for manual action")
 	}
 }
+
+func TestPlanSavesSnapshotAndExecRunsIt(t *testing.T) {
+	dir := t.TempDir()
+	oldwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := os.Chdir(oldwd); err != nil {
+			t.Fatal(err)
+		}
+	}()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(".rp", 0755); err != nil {
+		t.Fatal(err)
+	}
+	planner := []byte(`version: rp.dev/v0.1
+resources: {}
+capabilities:
+  say_ok:
+    purpose: observe
+    kind: command
+    inputs: {}
+    outputs:
+      result:
+        type: CommandResult
+        assertions:
+          - subject: result
+            predicate: completed
+            confidence: observed
+            when:
+              exit_code: 0
+            evidence_source: process_exit
+    command:
+      cwd: "."
+      argv:
+        - /bin/sh
+        - -c
+        - 'printf ok'
+    effects:
+      external: local_process
+      filesystem:
+        writes: []
+goals:
+  smoke:
+    requires_evidence:
+      - subject: result
+        predicate: completed
+        min_confidence: observed
+policies:
+  local_safe:
+    permissions: {}
+defaults:
+  policy: local_safe
+`)
+	if err := os.WriteFile(filepath.Join(".rp", "planner.yaml"), planner, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := cmdPlan([]string{"smoke"}); err != nil {
+		t.Fatal(err)
+	}
+	matches, err := filepath.Glob(filepath.Join(".rp", "cache", "plans", "plan-*.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != 1 {
+		t.Fatalf("expected one saved plan, got %d", len(matches))
+	}
+	planFile := filepath.Base(matches[0])
+	planID := planFile[:len(planFile)-len(".json")]
+	if err := cmdExec([]string{planID}); err != nil {
+		t.Fatal(err)
+	}
+	runDir, err := latestRunDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertions, err := assertionsFromRun(runDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(assertions) != 1 || assertions[0].Subject != "result" || assertions[0].Predicate != "completed" {
+		t.Fatalf("unexpected assertions: %+v", assertions)
+	}
+	events, err := readEvents(runDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !eventMatches(events[0], planID) {
+		t.Fatal("run_started should reference the executed saved plan")
+	}
+}

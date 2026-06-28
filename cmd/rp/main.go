@@ -154,6 +154,15 @@ type PlanStep struct {
 	Inputs     map[string]string `json:"inputs"`
 }
 
+type SavedPlan struct {
+	ID         string     `json:"id"`
+	Goal       string     `json:"goal"`
+	ConfigHash string     `json:"config_hash"`
+	PolicyHash string     `json:"policy_hash"`
+	CreatedAt  string     `json:"created_at"`
+	Steps      []PlanStep `json:"steps"`
+}
+
 type Event struct {
 	Type     string                 `json:"type"`
 	Time     string                 `json:"time"`
@@ -254,6 +263,7 @@ Usage:
   rp resource NAME
   rp plan GOAL [--explain] [--format text|json|dot|mermaid]
   rp achieve GOAL [--dry-run] [--step] [--yes]
+  rp exec PLAN_ID [--dry-run] [--step] [--yes]
   rp evidence GOAL
   rp why SUBJECT.PREDICATE
   rp trace QUERY
@@ -489,15 +499,19 @@ func cmdPlan(args []string) error {
 	if err != nil {
 		return err
 	}
+	saved, err := savePlan(root, fs.Arg(0), hash, hashPolicy(cfg), plan)
+	if err != nil {
+		return err
+	}
 	switch *format {
 	case "json":
-		return printJSON(map[string]interface{}{"goal": fs.Arg(0), "config_hash": hash, "steps": plan})
+		return printJSON(saved)
 	case "dot":
 		fmt.Print(renderDOT(plan))
 	case "mermaid":
 		fmt.Print(renderMermaid(plan))
 	case "text":
-		fmt.Printf("Goal: %s\nConfig: %s\nRoot: %s\n\n", fs.Arg(0), hash[:12], root)
+		fmt.Printf("Goal: %s\nConfig: %s\nRoot: %s\nSaved plan: %s\n\n", fs.Arg(0), hash[:12], root, saved.ID)
 		for i, step := range plan {
 			fmt.Printf("%d. %s\n   capability: %s\n   reason: %s\n", i+1, step.ID, step.Capability, step.Reason)
 			if *explain {
@@ -528,12 +542,15 @@ func cmdAchieve(args []string) error {
 	if err != nil {
 		return err
 	}
-	goalName := fs.Arg(0)
-	plan, err := buildPlan(cfg, goalName)
+	plan, err := buildPlan(cfg, fs.Arg(0))
 	if err != nil {
 		return err
 	}
-	if *dryRun {
+	return runPlan(root, cfg, configHash, fs.Arg(0), plan, "", *dryRun, *stepMode, *yes)
+}
+
+func runPlan(root string, cfg Config, configHash, goalName string, plan []PlanStep, planID string, dryRun, stepMode, yes bool) error {
+	if dryRun {
 		for i, step := range plan {
 			fmt.Printf("%d. %s (%s)\n", i+1, step.Capability, step.Reason)
 		}
@@ -544,14 +561,22 @@ func cmdAchieve(args []string) error {
 		return err
 	}
 	defer ctx.Events.Close()
-	appendEvent(ctx, "run_started", "", map[string]interface{}{"goal": goalName, "config_hash": configHash})
-	appendEvent(ctx, "plan_proposed", "", map[string]interface{}{"steps": plan})
+	startData := map[string]interface{}{"goal": goalName, "config_hash": configHash}
+	if planID != "" {
+		startData["plan_id"] = planID
+	}
+	appendEvent(ctx, "run_started", "", startData)
+	planData := map[string]interface{}{"steps": plan}
+	if planID != "" {
+		planData["plan_id"] = planID
+	}
+	appendEvent(ctx, "plan_proposed", "", planData)
 	resources := map[string]string{}
 	for k := range cfg.Resources {
 		resources[k] = k
 	}
 	for _, step := range plan {
-		if *stepMode && !ask("execute "+step.Capability+"?") {
+		if stepMode && !ask("execute "+step.Capability+"?") {
 			appendEvent(ctx, "run_stopped", "", map[string]interface{}{"reason": "step denied"})
 			return errors.New("stopped by user")
 		}
@@ -561,7 +586,7 @@ func cmdAchieve(args []string) error {
 			writeSummary(ctx, goalName, false, err.Error(), missingEvidenceWithConfig(ctx.RunDir, cfg.Goals[goalName], cfg))
 			return err
 		}
-		if needsWriteApproval(cfg, capability) && !*yes {
+		if needsWriteApproval(cfg, capability) && !yes {
 			appendEvent(ctx, "approval_requested", step.ID, map[string]interface{}{"permission": "filesystem.write"})
 			if !ask("approve filesystem write for " + step.Capability + "?") {
 				appendEvent(ctx, "approval_denied", step.ID, nil)
@@ -814,10 +839,28 @@ func cmdRerun(args []string) error {
 }
 
 func cmdExec(args []string) error {
-	if len(args) != 1 {
+	fs := flag.NewFlagSet("exec", flag.ContinueOnError)
+	stepMode := fs.Bool("step", false, "confirm every step")
+	yes := fs.Bool("yes", false, "approve required filesystem writes")
+	dryRun := fs.Bool("dry-run", false, "show saved plan without execution")
+	if err := fs.Parse(normalizeFlagArgs(args, map[string]bool{}, map[string]bool{"step": true, "yes": true, "dry-run": true})); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
 		return errors.New("usage: rp exec PLAN_ID")
 	}
-	return errors.New("saved plan execution is reserved in v0.1; use rp achieve GOAL or rp rerun RUN_ID")
+	root, cfg, configHash, err := loadProject()
+	if err != nil {
+		return err
+	}
+	plan, err := loadSavedPlan(root, fs.Arg(0))
+	if err != nil {
+		return err
+	}
+	if plan.ConfigHash != configHash {
+		return fmt.Errorf("saved plan %s was built for config %s, current config is %s; replan before exec", plan.ID, shortHash(plan.ConfigHash), shortHash(configHash))
+	}
+	return runPlan(root, cfg, configHash, plan.Goal, plan.Steps, plan.ID, *dryRun, *stepMode, *yes)
 }
 
 func loadProject() (string, Config, string, error) {
@@ -1174,6 +1217,51 @@ func goalFromRun(runID string) (string, error) {
 		return "", errors.New("run summary has no rerunnable goal")
 	}
 	return goal, nil
+}
+
+func savePlan(root, goalName, configHash, policyHash string, steps []PlanStep) (SavedPlan, error) {
+	plan := SavedPlan{
+		ID:         "plan-" + time.Now().UTC().Format("20060102T150405.000000000Z"),
+		Goal:       goalName,
+		ConfigHash: configHash,
+		PolicyHash: policyHash,
+		CreatedAt:  time.Now().UTC().Format(time.RFC3339Nano),
+		Steps:      steps,
+	}
+	dir := filepath.Join(root, ".rp", "cache", "plans")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return SavedPlan{}, err
+	}
+	b, err := json.MarshalIndent(plan, "", "  ")
+	if err != nil {
+		return SavedPlan{}, err
+	}
+	if err := os.WriteFile(filepath.Join(dir, plan.ID+".json"), append(b, '\n'), 0644); err != nil {
+		return SavedPlan{}, err
+	}
+	return plan, nil
+}
+
+func loadSavedPlan(root, planID string) (SavedPlan, error) {
+	if !strings.HasPrefix(planID, "plan-") {
+		return SavedPlan{}, errors.New("plan id must start with plan-")
+	}
+	path := filepath.Join(root, ".rp", "cache", "plans", planID+".json")
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return SavedPlan{}, err
+	}
+	var plan SavedPlan
+	if err := json.Unmarshal(b, &plan); err != nil {
+		return SavedPlan{}, err
+	}
+	if plan.ID != planID {
+		return SavedPlan{}, fmt.Errorf("saved plan id mismatch: file requested %s but contained %s", planID, plan.ID)
+	}
+	if plan.Goal == "" || len(plan.Steps) == 0 {
+		return SavedPlan{}, errors.New("saved plan is missing goal or steps")
+	}
+	return plan, nil
 }
 
 func goalSatisfied(runDir string, goal Goal) bool {
@@ -1638,6 +1726,13 @@ func safeName(s string) string {
 func sha(b []byte) string {
 	sum := sha256.Sum256(b)
 	return hex.EncodeToString(sum[:])
+}
+
+func shortHash(s string) string {
+	if len(s) <= 12 {
+		return s
+	}
+	return s[:12]
 }
 
 func confidenceAtLeast(got, min string) bool {

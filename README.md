@@ -10,6 +10,7 @@ slice described in `spec-v01.md`.
 go run ./cmd/rp version
 go run ./cmd/rp init
 go run ./cmd/rp plan bugfix_patch --explain
+go run ./cmd/rp exec plan-20260628T120000.000000000Z --yes
 go run ./cmd/rp achieve bugfix_patch --yes
 go run ./cmd/rp evidence bugfix_patch
 go run ./cmd/rp why patched_repo.tests_pass
@@ -25,7 +26,8 @@ Implemented commands include:
 - `goal init`
 - `policy init`
 - `add resource`, `resources`, `resource`
-- `plan` with `text`, `json`, `dot`, and `mermaid` output
+- `plan` with `text`, `json`, `dot`, and `mermaid` output plus saved plan snapshots
+- `exec` for saved plan execution
 - `achieve` with `--dry-run`, `--step`, and `--yes`
 - `evidence`, `why`, `trace`, `audit`, `replay`, `replan`, and `rerun`
 - manual `observe`, `attest`, and `add assertion`
