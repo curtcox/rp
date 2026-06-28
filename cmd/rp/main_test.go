@@ -382,8 +382,101 @@ func TestNeedsWriteApprovalUsesPolicy(t *testing.T) {
 		}},
 	}
 	capability := Capability{Effects: EffectSpec{Filesystem: map[string][]string{"writes": []string{"out.txt"}}}}
-	if !needsWriteApproval(cfg, capability) {
+	if !capabilityNeedsApproval(cfg, capability) {
 		t.Fatal("expected write approval")
+	}
+}
+
+func TestCapabilityApprovalRequiredIf(t *testing.T) {
+	cfg := Config{
+		Defaults: map[string]string{"policy": "local_safe"},
+		Policies: map[string]Policy{"local_safe": {
+			Permissions: map[string]interface{}{
+				"filesystem": map[string]interface{}{"write": "approval_required"},
+			},
+		}},
+	}
+	capability := Capability{
+		Approval: map[string]interface{}{
+			"required_if": []interface{}{
+				map[string]interface{}{"permission": "filesystem.write"},
+			},
+		},
+	}
+	if !capabilityNeedsApproval(cfg, capability) {
+		t.Fatal("expected approval from required_if")
+	}
+}
+
+func TestCheckGoalConstraintsRejectsNetwork(t *testing.T) {
+	goal := Goal{Constraints: map[string]interface{}{
+		"permissions": map[string]interface{}{"network": "forbidden"},
+	}}
+	cap := Capability{Effects: EffectSpec{Network: map[string]interface{}{"access": true}}}
+	if err := checkGoalConstraints(goal, cap); err == nil {
+		t.Fatal("expected goal network constraint error")
+	}
+}
+
+func TestCheckCapabilityPolicyRejectsForbiddenProcess(t *testing.T) {
+	cfg := Config{
+		Defaults: map[string]string{"policy": "local_safe"},
+		Policies: map[string]Policy{"local_safe": {
+			Permissions: map[string]interface{}{
+				"process": map[string]interface{}{"execute": "forbidden"},
+			},
+		}},
+	}
+	capability := Capability{Effects: EffectSpec{External: "local_process"}}
+	if err := checkCapabilityPolicy(cfg, capability); err == nil {
+		t.Fatal("expected forbidden process execution error")
+	}
+}
+
+func TestPlanRevisionNeedsConfirmation(t *testing.T) {
+	cfg := Config{
+		Defaults: map[string]string{"policy": "local_safe"},
+		Policies: map[string]Policy{"local_safe": {
+			Execution: map[string]interface{}{
+				"plan_changes": map[string]interface{}{
+					"allow_without_confirmation_if_not_increasing": []interface{}{"permissions", "risk", "cost_class"},
+				},
+			},
+		}},
+		Capabilities: map[string]Capability{
+			"observe": {Effects: EffectSpec{External: "local_process"}, Cost: map[string]interface{}{"risk": "low", "time": "cheap"}},
+			"apply": {
+				Effects: EffectSpec{External: "local_filesystem_write", Filesystem: map[string][]string{"writes": {"."}}},
+				Cost:    map[string]interface{}{"risk": "medium", "time": "cheap"},
+			},
+		},
+	}
+	confirm, reason := planRevisionNeedsConfirmation(cfg, []string{"observe"}, []string{"observe", "apply"})
+	if !confirm || !strings.Contains(reason, "permissions") {
+		t.Fatalf("expected permissions increase confirmation, got confirm=%v reason=%q", confirm, reason)
+	}
+	confirm, _ = planRevisionNeedsConfirmation(cfg, []string{"observe"}, []string{"observe"})
+	if confirm {
+		t.Fatal("unchanged plan should not require confirmation")
+	}
+}
+
+func TestFilterPlanByPolicyRemovesForbiddenNetwork(t *testing.T) {
+	cfg := Config{
+		Defaults: map[string]string{"policy": "local_safe"},
+		Policies: map[string]Policy{"local_safe": {
+			Permissions: map[string]interface{}{
+				"network": map[string]interface{}{"access": "forbidden"},
+			},
+		}},
+		Capabilities: map[string]Capability{
+			"ok":      {Effects: EffectSpec{External: "local_process"}},
+			"network": {Effects: EffectSpec{Network: map[string]interface{}{"access": true}}},
+		},
+	}
+	steps := filterPlanByPolicy(cfg, []PlanStep{{Capability: "ok"}, {Capability: "network"}})
+	if len(steps) != 1 || steps[0].Capability != "ok" {
+		t.Fatalf("expected only ok step, got %+v", steps)
 	}
 }
 

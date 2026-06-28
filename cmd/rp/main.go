@@ -649,6 +649,12 @@ func runPlan(root string, cfg Config, configHash, goalName string, plan []PlanSt
 			}
 			newCaps := planCapabilities(steps)
 			if stepNum > 0 && !sameCapabilities(lastPlanCaps, newCaps) {
+				if confirm, reason := planRevisionNeedsConfirmation(cfg, lastPlanCaps, newCaps); confirm && !yes {
+					if !ask("plan revised ("+reason+"), continue?") {
+						appendEvent(ctx, "run_stopped", "", map[string]interface{}{"reason": "plan revision denied"})
+						return errors.New("plan revision denied")
+					}
+				}
 				appendEvent(ctx, "plan_revised", "", map[string]interface{}{"steps": steps, "reason": "evidence gap replan"})
 				fmt.Printf("Plan revised (%d steps):\n", len(steps))
 				for i, s := range steps {
@@ -684,13 +690,18 @@ func runPlan(root string, cfg Config, configHash, goalName string, plan []PlanSt
 			writeSummary(ctx, goalName, false, err.Error(), missingEvidenceWithConfig(ctx.RunDir, goal, cfg))
 			return err
 		}
+		if err := checkGoalConstraints(goal, capability); err != nil {
+			appendEvent(ctx, "run_stopped", step.ID, map[string]interface{}{"reason": err.Error()})
+			writeSummary(ctx, goalName, false, err.Error(), missingEvidenceWithConfig(ctx.RunDir, goal, cfg))
+			return err
+		}
 		if err := checkStepPreconditions(ctx.RunDir, cfg, *step); err != nil {
 			appendEvent(ctx, "plan_invalidated", step.ID, map[string]interface{}{"reason": err.Error(), "suggest": "replan"})
 			appendEvent(ctx, "run_stopped", "", map[string]interface{}{"reason": err.Error(), "suggest_replan": true})
 			writeSummary(ctx, goalName, false, err.Error()+"; try: rp replan "+ctx.RunID, missingEvidenceWithConfig(ctx.RunDir, goal, cfg))
 			return err
 		}
-		if needsWriteApproval(cfg, capability) && !yes {
+		if capabilityNeedsApproval(cfg, capability) && !yes {
 			appendEvent(ctx, "approval_requested", step.ID, map[string]interface{}{"permission": "filesystem.write"})
 			if !ask("approve filesystem write for "+step.Capability+"?") {
 				appendEvent(ctx, "approval_denied", step.ID, nil)
@@ -1876,6 +1887,10 @@ func buildPlan(cfg Config, goalName string) ([]PlanStep, error) {
 	if len(steps) == 0 {
 		return nil, errors.New("no plan found")
 	}
+	steps = filterPlanByPolicy(cfg, steps)
+	if len(steps) == 0 {
+		return nil, errors.New("no plan found under active policy")
+	}
 	sort.Slice(steps, func(i, j int) bool {
 		pi, pj := planStepPriority(cfg, steps[i]), planStepPriority(cfg, steps[j])
 		if pi != pj {
@@ -2507,9 +2522,39 @@ func findAssertionCapability(cfg Config, subject, predicate string) string {
 	return ""
 }
 
+func filterPlanByPolicy(cfg Config, steps []PlanStep) []PlanStep {
+	var out []PlanStep
+	for _, step := range steps {
+		capability := cfg.Capabilities[step.Capability]
+		if err := checkCapabilityPolicy(cfg, capability); err != nil {
+			continue
+		}
+		out = append(out, step)
+	}
+	return out
+}
+
+func checkGoalConstraints(goal Goal, cap Capability) error {
+	perms, ok := goal.Constraints["permissions"].(map[string]interface{})
+	if !ok {
+		return nil
+	}
+	if val, _ := perms["network"].(string); val == "forbidden" && declaresNetworkEffect(cap) {
+		return errors.New("goal constraint forbids network access")
+	}
+	if val, _ := perms["credentials"].(string); val == "forbidden" && declaresCredentialUse(cap) {
+		return errors.New("goal constraint forbids credential use")
+	}
+	return nil
+}
+
 func checkCapabilityPolicy(cfg Config, cap Capability) error {
 	policyName := cfg.Defaults["policy"]
 	pol := cfg.Policies[policyName]
+	processExec := permissionValue(pol.Permissions, "process", "execute")
+	if processExec == "forbidden" {
+		return errors.New("policy forbids process execution")
+	}
 	networkAccess := permissionValue(pol.Permissions, "network", "access")
 	if networkAccess == "" {
 		networkAccess = "forbidden"
@@ -2538,13 +2583,123 @@ func declaresCredentialUse(cap Capability) bool {
 	return strings.Contains(strings.ToLower(cap.Effects.External), "credential")
 }
 
-func needsWriteApproval(cfg Config, cap Capability) bool {
+func capabilityNeedsApproval(cfg Config, cap Capability) bool {
+	if capabilityDeclaresWriteApproval(cap) {
+		policyName := cfg.Defaults["policy"]
+		pol := cfg.Policies[policyName]
+		if permissionValue(pol.Permissions, "filesystem", "write") == "approval_required" {
+			return true
+		}
+	}
 	if len(cap.Effects.Filesystem["writes"]) == 0 {
 		return false
 	}
 	policyName := cfg.Defaults["policy"]
 	pol := cfg.Policies[policyName]
 	return permissionValue(pol.Permissions, "filesystem", "write") == "approval_required"
+}
+
+func capabilityDeclaresWriteApproval(cap Capability) bool {
+	items, ok := cap.Approval["required_if"].([]interface{})
+	if !ok {
+		return false
+	}
+	for _, item := range items {
+		rule, ok := item.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if perm, _ := rule["permission"].(string); perm == "filesystem.write" {
+			return true
+		}
+	}
+	return false
+}
+
+func planChangeAutoAllowDimensions(cfg Config) []string {
+	raw, ok := activePolicy(cfg).Execution["plan_changes"].(map[string]interface{})
+	if !ok {
+		return nil
+	}
+	items, ok := raw["allow_without_confirmation_if_not_increasing"].([]interface{})
+	if !ok {
+		return nil
+	}
+	var out []string
+	for _, item := range items {
+		if s, ok := item.(string); ok {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+func planRevisionNeedsConfirmation(cfg Config, oldCaps, newCaps []string) (bool, string) {
+	allowed := planChangeAutoAllowDimensions(cfg)
+	if len(allowed) == 0 {
+		return false, ""
+	}
+	var reasons []string
+	for _, dim := range []string{"permissions", "risk", "cost_class"} {
+		if !containsString(allowed, dim) {
+			continue
+		}
+		if planDimensionScore(cfg, dim, newCaps) > planDimensionScore(cfg, dim, oldCaps) {
+			reasons = append(reasons, dim)
+		}
+	}
+	if len(reasons) == 0 {
+		return false, ""
+	}
+	return true, strings.Join(reasons, ", ") + " increased"
+}
+
+func planDimensionScore(cfg Config, dim string, capNames []string) int {
+	score := 0
+	for _, name := range capNames {
+		cap := cfg.Capabilities[name]
+		switch dim {
+		case "permissions":
+			if declaresNetworkEffect(cap) || declaresCredentialUse(cap) {
+				score = maxInt(score, 3)
+			}
+			if len(cap.Effects.Filesystem["writes"]) > 0 || capabilityDeclaresWriteApproval(cap) {
+				score = maxInt(score, 2)
+			}
+			if cap.Effects.External != "" {
+				score = maxInt(score, 1)
+			}
+		case "risk":
+			score = maxInt(score, rankString(cap.Cost["risk"], map[string]int{"low": 1, "medium": 2, "high": 3}))
+		case "cost_class":
+			score = maxInt(score, rankString(cap.Cost["time"], map[string]int{"cheap": 1, "moderate": 2, "expensive": 3}))
+		}
+	}
+	return score
+}
+
+func rankString(v interface{}, ranks map[string]int) int {
+	s, _ := v.(string)
+	if r, ok := ranks[s]; ok {
+		return r
+	}
+	return 0
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func containsString(items []string, want string) bool {
+	for _, item := range items {
+		if item == want {
+			return true
+		}
+	}
+	return false
 }
 
 func permissionValue(permissions map[string]interface{}, section, key string) string {
@@ -2626,7 +2781,7 @@ func summarizePlanEffects(cfg Config, plan []PlanStep) PlanEffectSummary {
 			seenExt[capability.Effects.External] = true
 			summary.External = append(summary.External, capability.Effects.External)
 		}
-		if needsWriteApproval(cfg, capability) {
+		if capabilityNeedsApproval(cfg, capability) {
 			summary.NeedsApproval = append(summary.NeedsApproval, step.Capability)
 		}
 	}

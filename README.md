@@ -41,7 +41,8 @@ replanning during `achieve`, executes command capabilities serially with
 execution-time precondition checks, supports `--auto-repair` retries governed by
 policy `execution.auto_repair`, records assertion supersession when evidence is
 corrected, writes a goal attestation bundle when evidence requirements are met,
-honors policy `hashing` rules for command output and file artifacts, prints an
+honors policy `hashing` rules for command output and file artifacts, enforces goal
+constraints and `execution.plan_changes` during JIT replan, prints an
 effect summary with plans and runs, writes artifacts under
 `.rp/runs/<run-id>/artifacts`, records append-only JSONL events (including
 `action_failed` for non-zero exits when `always_record_result` is set), and
