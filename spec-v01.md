@@ -1,5 +1,3 @@
-Below is the consolidated v0.1 specification package from the interview.
-
 rp v0.1 Specification Draft
 
 1. One-page product thesis
