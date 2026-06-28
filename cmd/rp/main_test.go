@@ -1357,3 +1357,84 @@ func TestInputHashesForGoalHashesFileResources(t *testing.T) {
 		t.Fatalf("expected bug_report hash, got %+v", hashes)
 	}
 }
+
+func TestCheckCapabilityPolicyRejectsForbiddenExternalSideEffect(t *testing.T) {
+	cfg := Config{
+		Defaults: map[string]string{"policy": "local_safe"},
+		Policies: map[string]Policy{"local_safe": {
+			Permissions: map[string]interface{}{
+				"external_side_effects": map[string]interface{}{
+					"create_pull_request": "forbidden",
+				},
+			},
+		}},
+	}
+	capability := Capability{Effects: EffectSpec{
+		ExternalSideEffects: map[string]interface{}{"create_pull_request": true},
+	}}
+	if err := checkCapabilityPolicy(cfg, capability); err == nil {
+		t.Fatal("expected forbidden external side effect error")
+	}
+}
+
+func TestFilterPlanByPolicyRemovesForbiddenExternalSideEffect(t *testing.T) {
+	cfg := Config{
+		Defaults: map[string]string{"policy": "local_safe"},
+		Policies: map[string]Policy{"local_safe": {
+			Permissions: map[string]interface{}{
+				"external_side_effects": map[string]interface{}{"deploy": "forbidden"},
+			},
+		}},
+		Capabilities: map[string]Capability{
+			"ok":     {Effects: EffectSpec{External: "local_process"}},
+			"deploy": {Effects: EffectSpec{ExternalSideEffects: map[string]interface{}{"deploy": true}}},
+		},
+	}
+	steps := filterPlanByPolicy(cfg, []PlanStep{{Capability: "ok"}, {Capability: "deploy"}})
+	if len(steps) != 1 || steps[0].Capability != "ok" {
+		t.Fatalf("expected only ok step, got %+v", steps)
+	}
+}
+
+func TestCheckCapabilityPolicyRejectsCredentialRefInput(t *testing.T) {
+	cfg := Config{
+		Defaults: map[string]string{"policy": "local_safe"},
+		Policies: map[string]Policy{"local_safe": {
+			Permissions: map[string]interface{}{
+				"credentials": map[string]interface{}{"use": "forbidden"},
+			},
+		}},
+	}
+	capability := Capability{
+		Inputs: map[string]InputSpec{"token": {Type: "CredentialRef"}},
+	}
+	if err := checkCapabilityPolicy(cfg, capability); err == nil {
+		t.Fatal("expected forbidden credential use for CredentialRef input")
+	}
+}
+
+func TestFailureStopDataHonorsOnFailurePolicy(t *testing.T) {
+	cfg := Config{
+		Defaults: map[string]string{"policy": "local_safe"},
+		Policies: map[string]Policy{"local_safe": {
+			Execution: map[string]interface{}{"on_failure": "stop"},
+		}},
+	}
+	data, summary := failureStopData(cfg, "run-123", "boom")
+	if _, ok := data["suggest_replan"]; ok {
+		t.Fatal("stop mode should not suggest replan")
+	}
+	if strings.Contains(summary, "replan") {
+		t.Fatalf("stop mode summary should not mention replan: %q", summary)
+	}
+	cfg.Policies["local_safe"] = Policy{
+		Execution: map[string]interface{}{"on_failure": "stop_and_suggest"},
+	}
+	data, summary = failureStopData(cfg, "run-123", "boom")
+	if data["suggest_replan"] != true {
+		t.Fatal("stop_and_suggest should suggest replan")
+	}
+	if !strings.Contains(summary, "rp replan run-123") {
+		t.Fatalf("expected replan hint in summary, got %q", summary)
+	}
+}

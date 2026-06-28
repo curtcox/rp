@@ -121,10 +121,11 @@ type SaveAsSpec struct {
 }
 
 type EffectSpec struct {
-	External   string                 `yaml:"external,omitempty" json:"external,omitempty"`
-	Planner    string                 `yaml:"planner,omitempty" json:"planner,omitempty"`
-	Filesystem map[string][]string    `yaml:"filesystem,omitempty" json:"filesystem,omitempty"`
-	Network    map[string]interface{} `yaml:"network,omitempty" json:"network,omitempty"`
+	External            string                 `yaml:"external,omitempty" json:"external,omitempty"`
+	Planner             string                 `yaml:"planner,omitempty" json:"planner,omitempty"`
+	Filesystem          map[string][]string    `yaml:"filesystem,omitempty" json:"filesystem,omitempty"`
+	Network             map[string]interface{} `yaml:"network,omitempty" json:"network,omitempty"`
+	ExternalSideEffects map[string]interface{} `yaml:"external_side_effects,omitempty" json:"external_side_effects,omitempty"`
 }
 
 type Policy struct {
@@ -380,6 +381,10 @@ policies:
         access: forbidden
       credentials:
         use: forbidden
+      external_side_effects:
+        create_pull_request: forbidden
+        send_message: forbidden
+        deploy: forbidden
     environment:
       inherit: false
       allow:
@@ -697,8 +702,9 @@ func runPlan(root string, cfg Config, configHash, goalName string, plan []PlanSt
 		}
 		if err := checkStepPreconditions(ctx.RunDir, cfg, *step); err != nil {
 			appendEvent(ctx, "plan_invalidated", step.ID, map[string]interface{}{"reason": err.Error(), "suggest": "replan"})
-			appendEvent(ctx, "run_stopped", "", map[string]interface{}{"reason": err.Error(), "suggest_replan": true})
-			writeSummary(ctx, goalName, false, err.Error()+"; try: rp replan "+ctx.RunID, missingEvidenceWithConfig(ctx.RunDir, goal, cfg))
+			stopData, summaryReason := failureStopData(cfg, ctx.RunID, err.Error())
+			appendEvent(ctx, "run_stopped", "", stopData)
+			writeSummary(ctx, goalName, false, summaryReason, missingEvidenceWithConfig(ctx.RunDir, goal, cfg))
 			return err
 		}
 		if perm := capabilityApprovalPermission(cfg, capability); perm != "" && !yes {
@@ -719,8 +725,9 @@ func runPlan(root string, cfg Config, configHash, goalName string, plan []PlanSt
 				fmt.Printf("auto-repair: replanning after %s failure (%d/%d)\n", step.Capability, failureCount, maxAttempts)
 				continue
 			}
-			appendEvent(ctx, "run_stopped", "", map[string]interface{}{"reason": err.Error(), "suggest_replan": true})
-			writeSummary(ctx, goalName, false, err.Error()+"; try: rp replan "+ctx.RunID, missingEvidenceWithConfig(ctx.RunDir, goal, cfg))
+			stopData, summaryReason := failureStopData(cfg, ctx.RunID, err.Error())
+			appendEvent(ctx, "run_stopped", "", stopData)
+			writeSummary(ctx, goalName, false, summaryReason, missingEvidenceWithConfig(ctx.RunDir, goal, cfg))
 			return err
 		}
 		executedCaps[step.Capability] = true
@@ -1579,7 +1586,7 @@ var assertionSpecKeys = map[string]bool{"subject": true, "predicate": true, "obj
 var commandKeys = map[string]bool{"cwd": true, "argv": true, "stdout": true, "stderr": true}
 var streamKeys = map[string]bool{"save_as": true, "save_as_artifact": true, "media_type": true}
 var saveAsKeys = map[string]bool{"resource": true, "artifact_path": true, "media_type": true}
-var effectKeys = map[string]bool{"external": true, "planner": true, "filesystem": true, "network": true}
+var effectKeys = map[string]bool{"external": true, "planner": true, "filesystem": true, "network": true, "external_side_effects": true}
 var policyKeys = map[string]bool{
 	"description": true, "permissions": true, "environment": true, "evidence": true,
 	"hashing": true, "execution": true, "max_cost": true,
@@ -2762,6 +2769,9 @@ func checkCapabilityPolicy(cfg Config, cap Capability) error {
 	if credentialUse == "forbidden" && declaresCredentialUse(cap) {
 		return errors.New("policy forbids credential use")
 	}
+	if err := checkExternalSideEffectsPolicy(pol, cap); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -2773,7 +2783,87 @@ func declaresNetworkEffect(cap Capability) bool {
 }
 
 func declaresCredentialUse(cap Capability) bool {
+	if usesCredentialRefs(cap) {
+		return true
+	}
 	return strings.Contains(strings.ToLower(cap.Effects.External), "credential")
+}
+
+func usesCredentialRefs(cap Capability) bool {
+	for _, in := range cap.Inputs {
+		if in.Type == "CredentialRef" {
+			return true
+		}
+	}
+	return false
+}
+
+func declaredExternalSideEffects(cap Capability) []string {
+	seen := map[string]bool{}
+	var out []string
+	add := func(name string) {
+		if name == "" || seen[name] {
+			return
+		}
+		seen[name] = true
+		out = append(out, name)
+	}
+	for name, raw := range cap.Effects.ExternalSideEffects {
+		if boolFieldValue(raw) {
+			add(name)
+		}
+	}
+	ext := strings.ToLower(cap.Effects.External)
+	for _, name := range []string{"create_pull_request", "send_message", "deploy"} {
+		if strings.Contains(ext, name) {
+			add(name)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+func checkExternalSideEffectsPolicy(pol Policy, cap Capability) error {
+	perms, ok := pol.Permissions["external_side_effects"].(map[string]interface{})
+	if !ok {
+		return nil
+	}
+	for _, effect := range declaredExternalSideEffects(cap) {
+		val, _ := perms[effect].(string)
+		if val == "forbidden" {
+			return fmt.Errorf("policy forbids external side effect %s", effect)
+		}
+	}
+	return nil
+}
+
+func boolFieldValue(v interface{}) bool {
+	switch x := v.(type) {
+	case bool:
+		return x
+	case string:
+		return x == "true" || x == "yes"
+	default:
+		return false
+	}
+}
+
+func failureBehavior(cfg Config) string {
+	pol := activePolicy(cfg)
+	if behavior, ok := pol.Execution["on_failure"].(string); ok && behavior != "" {
+		return behavior
+	}
+	return "stop_and_suggest"
+}
+
+func failureStopData(cfg Config, runID, reason string) (map[string]interface{}, string) {
+	data := map[string]interface{}{"reason": reason, "on_failure": failureBehavior(cfg)}
+	summary := reason
+	if failureBehavior(cfg) == "stop_and_suggest" {
+		data["suggest_replan"] = true
+		summary += "; try: rp replan " + runID
+	}
+	return data, summary
 }
 
 func capabilityApprovalPermission(cfg Config, cap Capability) string {
@@ -2970,9 +3060,10 @@ func resolveSubject(subject string, step PlanStep) string {
 }
 
 type PlanEffectSummary struct {
-	External         []string `json:"external,omitempty"`
-	FilesystemWrites []string `json:"filesystem_writes,omitempty"`
-	NeedsApproval    []string `json:"needs_approval,omitempty"`
+	External            []string `json:"external,omitempty"`
+	ExternalSideEffects []string `json:"external_side_effects,omitempty"`
+	FilesystemWrites    []string `json:"filesystem_writes,omitempty"`
+	NeedsApproval       []string `json:"needs_approval,omitempty"`
 }
 
 func summarizePlanEffects(cfg Config, plan []PlanStep) PlanEffectSummary {
@@ -2991,24 +3082,45 @@ func summarizePlanEffects(cfg Config, plan []PlanStep) PlanEffectSummary {
 			seenExt[capability.Effects.External] = true
 			summary.External = append(summary.External, capability.Effects.External)
 		}
+		for _, effect := range declaredExternalSideEffects(capability) {
+			summary.ExternalSideEffects = append(summary.ExternalSideEffects, effect)
+		}
 		if capabilityNeedsApproval(cfg, capability) {
 			summary.NeedsApproval = append(summary.NeedsApproval, step.Capability)
 		}
 	}
 	sort.Strings(summary.FilesystemWrites)
 	sort.Strings(summary.External)
+	sort.Strings(summary.ExternalSideEffects)
 	sort.Strings(summary.NeedsApproval)
+	summary.ExternalSideEffects = dedupeStrings(summary.ExternalSideEffects)
 	return summary
+}
+
+func dedupeStrings(items []string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, item := range items {
+		if item == "" || seen[item] {
+			continue
+		}
+		seen[item] = true
+		out = append(out, item)
+	}
+	return out
 }
 
 func printEffectSummary(cfg Config, plan []PlanStep) {
 	summary := summarizePlanEffects(cfg, plan)
-	if len(summary.FilesystemWrites) == 0 && len(summary.External) == 0 && len(summary.NeedsApproval) == 0 {
+	if len(summary.FilesystemWrites) == 0 && len(summary.External) == 0 && len(summary.ExternalSideEffects) == 0 && len(summary.NeedsApproval) == 0 {
 		return
 	}
 	fmt.Println("\nEffect summary:")
 	if len(summary.External) > 0 {
 		fmt.Printf("  external: %s\n", strings.Join(summary.External, ", "))
+	}
+	if len(summary.ExternalSideEffects) > 0 {
+		fmt.Printf("  external side effects: %s\n", strings.Join(summary.ExternalSideEffects, ", "))
 	}
 	if len(summary.FilesystemWrites) > 0 {
 		fmt.Println("  filesystem writes:")
