@@ -1,0 +1,33 @@
+version: rp.dev/v0.1
+goals:
+  bugfix_patch:
+    description: Produce a patch for the bug report and evidence that configured tests pass.
+    given:
+      repo: repo
+      bug_report: bug_report
+    produce:
+      patch:
+        type: Patch
+        required_realization:
+          kind: file
+          media_type: text/x-diff
+    requires_evidence:
+      - subject: patch
+        predicate: applies_cleanly
+        min_confidence: observed
+        any_source_type:
+          - process_exit
+          - command_result
+      - subject: patched_repo
+        predicate: tests_pass
+        min_confidence: observed
+        any_source_type:
+          - process_exit
+          - test_report
+    constraints:
+      permissions:
+        network: forbidden
+        credentials: forbidden
+      max_cost:
+        time: 10m
+        money_usd: 0

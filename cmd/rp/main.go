@@ -192,6 +192,7 @@ type AssertionRecord struct {
 	EvidenceID     string `json:"evidence_id"`
 	EvidenceSource string `json:"evidence_source"`
 	ActionID       string `json:"action_id"`
+	Supersedes     string `json:"supersedes,omitempty"`
 }
 
 func main() {
@@ -265,7 +266,7 @@ Usage:
   rp resources
   rp resource NAME
   rp plan GOAL [--explain] [--format text|json|dot|mermaid]
-  rp achieve GOAL [--dry-run] [--step] [--yes]
+  rp achieve GOAL [--dry-run] [--step] [--yes] [--auto-repair] [--max-attempts N]
   rp exec PLAN_ID [--dry-run] [--step] [--yes]
   rp evidence GOAL
   rp why SUBJECT.PREDICATE
@@ -532,12 +533,11 @@ func cmdAchieve(args []string) error {
 	dryRun := fs.Bool("dry-run", false, "show and record no execution")
 	stepMode := fs.Bool("step", false, "confirm every step")
 	yes := fs.Bool("yes", false, "approve required filesystem writes")
-	autoRepair := fs.Bool("auto-repair", false, "accepted for v0.1 compatibility")
-	maxAttempts := fs.Int("max-attempts", 1, "accepted for v0.1 compatibility")
+	autoRepair := fs.Bool("auto-repair", false, "retry failed steps by replanning")
+	maxAttempts := fs.Int("max-attempts", 0, "max failure retries when auto-repair is enabled (0 uses policy default)")
 	if err := fs.Parse(normalizeFlagArgs(args, map[string]bool{"max-attempts": true}, map[string]bool{"dry-run": true, "step": true, "yes": true, "auto-repair": true})); err != nil {
 		return err
 	}
-	_, _ = autoRepair, maxAttempts
 	if fs.NArg() != 1 {
 		return errors.New("usage: rp achieve GOAL")
 	}
@@ -549,10 +549,11 @@ func cmdAchieve(args []string) error {
 	if err != nil {
 		return err
 	}
-	return runPlan(root, cfg, configHash, fs.Arg(0), plan, "", *dryRun, *stepMode, *yes, true)
+	repairEnabled, repairMax := autoRepairSettings(cfg, *autoRepair, *maxAttempts)
+	return runPlan(root, cfg, configHash, fs.Arg(0), plan, "", *dryRun, *stepMode, *yes, true, repairEnabled, repairMax)
 }
 
-func runPlan(root string, cfg Config, configHash, goalName string, plan []PlanStep, planID string, dryRun, stepMode, yes, jit bool) error {
+func runPlan(root string, cfg Config, configHash, goalName string, plan []PlanStep, planID string, dryRun, stepMode, yes, jit bool, autoRepair bool, maxAttempts int) error {
 	if dryRun {
 		for i, step := range plan {
 			fmt.Printf("%d. %s (%s)\n", i+1, step.Capability, step.Reason)
@@ -585,6 +586,7 @@ func runPlan(root string, cfg Config, configHash, goalName string, plan []PlanSt
 	goal := cfg.Goals[goalName]
 	executedCaps := map[string]bool{}
 	stepNum := 0
+	failureCount := 0
 	lastPlanCaps := planCapabilities(plan)
 	for {
 		if len(missingEvidenceWithConfig(ctx.RunDir, goal, cfg)) == 0 {
@@ -650,7 +652,15 @@ func runPlan(root string, cfg Config, configHash, goalName string, plan []PlanSt
 			appendEvent(ctx, "approval_granted", step.ID, nil)
 		}
 		if err := executeStep(ctx, cfg, *step, resources); err != nil {
+			failureCount++
 			appendEvent(ctx, "plan_invalidated", step.ID, map[string]interface{}{"reason": err.Error(), "suggest": "replan"})
+			if autoRepair && failureCount < maxAttempts {
+				appendEvent(ctx, "auto_repair_attempted", step.ID, map[string]interface{}{
+					"attempt": failureCount, "max_attempts": maxAttempts, "capability": step.Capability,
+				})
+				fmt.Printf("auto-repair: replanning after %s failure (%d/%d)\n", step.Capability, failureCount, maxAttempts)
+				continue
+			}
 			appendEvent(ctx, "run_stopped", "", map[string]interface{}{"reason": err.Error(), "suggest_replan": true})
 			writeSummary(ctx, goalName, false, err.Error()+"; try: rp replan "+ctx.RunID, missingEvidenceWithConfig(ctx.RunDir, goal, cfg))
 			return err
@@ -722,7 +732,7 @@ func cmdWhy(args []string) error {
 		return err
 	}
 	best := AssertionRecord{Confidence: "unsupported"}
-	for _, a := range assertions {
+	for _, a := range effectiveAssertions(assertions) {
 		if a.Subject == subject && a.Predicate == predicate && confidenceAtLeast(a.Confidence, best.Confidence) {
 			best = a
 		}
@@ -820,7 +830,7 @@ func cmdObserve(args []string) error {
 			ID: "as-" + actionID + "-clean-worktree", Subject: fs.Arg(0), Predicate: "clean_worktree",
 			Confidence: "observed", EvidenceID: evidenceID, EvidenceSource: "process_exit", ActionID: actionID,
 		}
-		appendEvent(ctx, "assertion_recorded", actionID, structToMap(rec))
+		recordAssertion(ctx, actionID, rec)
 	}
 	appendEvent(ctx, "action_completed", actionID, map[string]interface{}{"exit_code": exitCode})
 	if err := writeSummary(ctx, "manual_observe", exitCode == 0, "manual git_status observation recorded"); err != nil {
@@ -930,6 +940,8 @@ func cmdReplay(args []string) error {
 			confidence, _ := ev.Data["confidence"].(string)
 			source, _ := ev.Data["evidence_source"].(string)
 			fmt.Printf("[%s] assertion %s.%s confidence=%s source=%s\n", shortTime(ev.Time), subject, predicate, confidence, source)
+		case "assertion_superseded":
+			fmt.Printf("[%s] assertion superseded: %v by %v\n", shortTime(ev.Time), ev.Data["id"], ev.Data["superseded_by"])
 		case "resource_realization_recorded":
 			fmt.Printf("[%s] resource realization %v\n", shortTime(ev.Time), ev.Data["resource"])
 		case "artifact_recorded":
@@ -949,8 +961,12 @@ func cmdReplay(args []string) error {
 	assertions, err := assertionsFromRun(runDir)
 	if err == nil && len(assertions) > 0 {
 		fmt.Println("\nAssertions:")
-		for _, as := range assertions {
-			fmt.Printf("  %s.%s %s (via %s, action %s)\n", as.Subject, as.Predicate, as.Confidence, as.EvidenceSource, as.ActionID)
+		for _, as := range effectiveAssertions(assertions) {
+			line := fmt.Sprintf("  %s.%s %s (via %s, action %s)", as.Subject, as.Predicate, as.Confidence, as.EvidenceSource, as.ActionID)
+			if as.Supersedes != "" {
+				line += fmt.Sprintf(" supersedes %s", as.Supersedes)
+			}
+			fmt.Println(line)
 		}
 	}
 	return nil
@@ -1009,7 +1025,8 @@ func cmdExec(args []string) error {
 	if plan.ConfigHash != configHash {
 		return fmt.Errorf("saved plan %s was built for config %s, current config is %s; replan before exec", plan.ID, shortHash(plan.ConfigHash), shortHash(configHash))
 	}
-	return runPlan(root, cfg, configHash, plan.Goal, plan.Steps, plan.ID, *dryRun, *stepMode, *yes, false)
+	repairEnabled, repairMax := autoRepairSettings(cfg, false, 0)
+	return runPlan(root, cfg, configHash, plan.Goal, plan.Steps, plan.ID, *dryRun, *stepMode, *yes, false, repairEnabled, repairMax)
 }
 
 func loadProject() (string, Config, string, error) {
@@ -1322,7 +1339,7 @@ func checkStepPreconditions(runDir string, cfg Config, step PlanStep) error {
 			if subject == "" {
 				subject = inputName
 			}
-			if !assertionRequirementMet(assertions, req, subject, cfg) {
+			if !assertionRequirementMet(effectiveAssertions(assertions), req, subject, cfg) {
 				return fmt.Errorf("precondition %s.%s>=%s not satisfied for %s", subject, req.Predicate, req.MinConfidence, step.Capability)
 			}
 		}
@@ -1332,7 +1349,7 @@ func checkStepPreconditions(runDir string, cfg Config, step PlanStep) error {
 		if subject == "" {
 			subject = step.Inputs["repo"]
 		}
-		if !assertionRequirementMet(assertions, req, subject, cfg) {
+		if !assertionRequirementMet(effectiveAssertions(assertions), req, subject, cfg) {
 			return fmt.Errorf("precondition %s.%s>=%s not satisfied for %s", subject, req.Predicate, req.MinConfidence, step.Capability)
 		}
 	}
@@ -1825,7 +1842,7 @@ func executeStep(ctx RunContext, cfg Config, step PlanStep, resources map[string
 					Subject: subj, Predicate: as.Predicate, Object: as.Object,
 					Confidence: confidence, EvidenceID: evidenceID, EvidenceSource: evidenceSource, ActionID: actionID,
 				}
-				appendEvent(ctx, "assertion_recorded", actionID, structToMap(rec))
+				recordAssertion(ctx, actionID, rec)
 			}
 		}
 	}
@@ -2002,10 +2019,11 @@ func missingEvidenceWithConfig(runDir string, goal Goal, cfg Config) []Requireme
 	if err != nil {
 		return goal.RequiresEvidence
 	}
+	effective := effectiveAssertions(assertions)
 	var missing []Requirement
 	for _, req := range goal.RequiresEvidence {
 		ok := false
-		for _, as := range assertions {
+		for _, as := range effective {
 			if as.Subject == req.Subject && as.Predicate == req.Predicate && confidenceAtLeast(as.Confidence, req.MinConfidence) && sourceAllowed(as.EvidenceSource, req.AnySourceType) && sourceMaySatisfyRequiredEvidence(cfg, as.EvidenceSource) {
 				ok = true
 			}
@@ -2034,6 +2052,74 @@ func assertionsFromRun(runDir string) ([]AssertionRecord, error) {
 		}
 	}
 	return out, nil
+}
+
+func effectiveAssertions(assertions []AssertionRecord) []AssertionRecord {
+	superseded := map[string]bool{}
+	for _, as := range assertions {
+		if as.Supersedes != "" {
+			superseded[as.Supersedes] = true
+		}
+	}
+	var out []AssertionRecord
+	for _, as := range assertions {
+		if !superseded[as.ID] {
+			out = append(out, as)
+		}
+	}
+	return out
+}
+
+func recordAssertion(ctx RunContext, actionID string, rec AssertionRecord) {
+	assertions, _ := assertionsFromRun(ctx.RunDir)
+	if prev := latestAssertion(assertions, rec.Subject, rec.Predicate); prev.ID != "" {
+		rec.Supersedes = prev.ID
+		appendEvent(ctx, "assertion_superseded", actionID, map[string]interface{}{
+			"id": prev.ID, "superseded_by": rec.ID,
+		})
+	}
+	appendEvent(ctx, "assertion_recorded", actionID, structToMap(rec))
+}
+
+func latestAssertion(assertions []AssertionRecord, subject, predicate string) AssertionRecord {
+	effective := effectiveAssertions(assertions)
+	var best AssertionRecord
+	for _, as := range effective {
+		if as.Subject == subject && as.Predicate == predicate {
+			best = as
+		}
+	}
+	return best
+}
+
+func autoRepairSettings(cfg Config, flagEnabled bool, flagMax int) (bool, int) {
+	pol := activePolicy(cfg)
+	maxAttempts := 1
+	if raw, ok := pol.Execution["auto_repair"].(map[string]interface{}); ok {
+		if enabled, ok := boolField(raw, "enabled"); ok && enabled {
+			flagEnabled = true
+		}
+		if n, ok := intField(raw, "max_attempts"); ok && n > 0 {
+			maxAttempts = n
+		}
+	}
+	if flagMax > 0 {
+		maxAttempts = flagMax
+	}
+	return flagEnabled, maxAttempts
+}
+
+func intField(m map[string]interface{}, key string) (int, bool) {
+	switch v := m[key].(type) {
+	case int:
+		return v, true
+	case int64:
+		return int(v), true
+	case float64:
+		return int(v), true
+	default:
+		return 0, false
+	}
 }
 
 func readEvents(runDir string) ([]Event, error) {
@@ -2082,7 +2168,7 @@ func appendManualAssertion(subject, predicate, object, confidence, source, note,
 		ID: "as-" + actionID, Subject: subject, Predicate: predicate, Object: object,
 		Confidence: capConfidenceByPolicy(cfg, source, confidence), EvidenceID: evidenceID, EvidenceSource: source, ActionID: actionID,
 	}
-	appendEvent(ctx, "assertion_recorded", actionID, structToMap(rec))
+	recordAssertion(ctx, actionID, rec)
 	appendEvent(ctx, "attestation_recorded", actionID, map[string]interface{}{
 		"id": "att-" + actionID, "assertion_ids": []string{rec.ID}, "evidence_ids": []string{evidenceID},
 		"config_hash": ctx.ConfigHash, "policy_hash": ctx.PolicyHash, "run_id": ctx.RunID,

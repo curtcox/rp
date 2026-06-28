@@ -1,0 +1,126 @@
+version: rp.dev/v0.1
+capabilities:
+  check_patch_applies:
+    purpose: observe
+    kind: command
+    inputs:
+      repo:
+        type: GitRepo
+      patch:
+        type: Patch
+        realization:
+          media_type: text/x-diff
+    outputs:
+      patch_apply_result:
+        type: CommandResult
+        assertions:
+          - subject: patch
+            predicate: applies_cleanly
+            confidence: observed
+            when:
+              exit_code: 0
+            evidence_source: process_exit
+    command:
+      cwd: "${inputs.repo.path}"
+      argv:
+        - git
+        - apply
+        - --check
+        - "${inputs.patch.path}"
+    always_record_result: true
+    effects:
+      external: local_process
+      filesystem:
+        writes: []
+    nondeterminism:
+      - external_process
+    idempotence: idempotent
+    cost:
+      time: cheap
+      money_usd: 0
+      risk: low
+      human_attention: none
+  apply_patch_to_worktree:
+    purpose: derive
+    kind: command
+    inputs:
+      repo:
+        type: GitRepo
+      patch:
+        type: Patch
+        requires:
+          - predicate: applies_cleanly
+            min_confidence: observed
+    outputs:
+      patched_repo:
+        type: GitRepo
+        realization:
+          kind: local_path
+        assertions:
+          - subject: patched_repo
+            predicate: derived_from
+            object: repo
+            confidence: observed
+            evidence_source: command_result
+    command:
+      cwd: "${inputs.repo.path}"
+      argv:
+        - git
+        - apply
+        - "${inputs.patch.path}"
+    approval:
+      required_if:
+        - permission: filesystem.write
+    always_record_result: true
+    effects:
+      external: local_filesystem_write
+      filesystem:
+        writes:
+          - "${inputs.repo.path}"
+    nondeterminism:
+      - external_process
+    idempotence: non_idempotent
+    cost:
+      time: cheap
+      money_usd: 0
+      risk: medium
+      human_attention: approval_if_required
+  run_tests:
+    purpose: observe
+    kind: command
+    inputs:
+      repo:
+        type: GitRepo
+    outputs:
+      test_result:
+        type: TestResult
+        assertions:
+          - subject: repo
+            predicate: tests_pass
+            confidence: observed
+            when:
+              exit_code: 0
+            evidence_source: process_exit
+    command:
+      cwd: "${inputs.repo.path}"
+      argv:
+        - ./scripts/run_tests.sh
+      stdout:
+        save_as_artifact: pytest.stdout
+        media_type: text/plain
+      stderr:
+        save_as_artifact: pytest.stderr
+        media_type: text/plain
+    always_record_result: true
+    effects:
+      external: local_process
+      filesystem:
+        writes: []
+    nondeterminism:
+      - external_process
+    idempotence: unknown
+    cost:
+      time: moderate
+      money_usd: 0
+      risk: low
+      human_attention: none

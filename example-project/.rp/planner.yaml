@@ -1,0 +1,24 @@
+version: rp.dev/v0.1
+imports:
+  - capabilities/git.yaml
+  - capabilities/patch.yaml
+  - capabilities/tests.yaml
+  - policies/local-safe.yaml
+  - goals/bugfix.yaml
+resources:
+  repo:
+    type: GitRepo
+    realizations:
+      - id: repo.local
+        kind: local_path
+        uri: file://.
+        media_type: inode/directory
+  bug_report:
+    type: BugReport
+    realizations:
+      - id: bug_report.markdown
+        kind: file
+        uri: file://bug.md
+        media_type: text/markdown
+defaults:
+  policy: local_safe

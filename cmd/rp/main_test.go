@@ -724,6 +724,146 @@ func TestCheckStepPreconditions(t *testing.T) {
 	}
 }
 
+func TestAssertionSupersessionKeepsLatestEffective(t *testing.T) {
+	runDir := t.TempDir()
+	events := []byte(`{"type":"assertion_recorded","data":{"id":"as-1","subject":"patch","predicate":"applies_cleanly","confidence":"claimed","evidence_id":"ev-1","evidence_source":"llm_claim","action_id":"act-1"}}
+{"type":"assertion_recorded","data":{"id":"as-2","subject":"patch","predicate":"applies_cleanly","confidence":"observed","evidence_id":"ev-2","evidence_source":"process_exit","action_id":"act-2","supersedes":"as-1"}}
+{"type":"assertion_superseded","data":{"id":"as-1","superseded_by":"as-2"}}
+`)
+	if err := os.WriteFile(filepath.Join(runDir, "events.jsonl"), events, 0644); err != nil {
+		t.Fatal(err)
+	}
+	all, err := assertionsFromRun(runDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 2 {
+		t.Fatalf("expected two recorded assertions, got %d", len(all))
+	}
+	effective := effectiveAssertions(all)
+	if len(effective) != 1 {
+		t.Fatalf("expected one effective assertion, got %+v", effective)
+	}
+	if effective[0].ID != "as-2" || effective[0].Confidence != "observed" {
+		t.Fatalf("unexpected effective assertion: %+v", effective[0])
+	}
+	goal := Goal{RequiresEvidence: []Requirement{{
+		Subject: "patch", Predicate: "applies_cleanly", MinConfidence: "observed",
+		AnySourceType: []string{"process_exit"},
+	}}}
+	if len(missingEvidenceWithConfig(runDir, goal, Config{})) != 0 {
+		t.Fatal("superseding observed assertion should satisfy evidence requirement")
+	}
+}
+
+func TestAutoRepairSettings(t *testing.T) {
+	cfg := Config{
+		Defaults: map[string]string{"policy": "local_safe"},
+		Policies: map[string]Policy{"local_safe": {
+			Execution: map[string]interface{}{
+				"auto_repair": map[string]interface{}{"enabled": true, "max_attempts": 3},
+			},
+		}},
+	}
+	enabled, max := autoRepairSettings(cfg, false, 0)
+	if !enabled || max != 3 {
+		t.Fatalf("policy auto_repair should enable with max 3, got enabled=%v max=%d", enabled, max)
+	}
+	enabled, max = autoRepairSettings(cfg, false, 5)
+	if !enabled || max != 5 {
+		t.Fatalf("policy enabled with flag max override, got enabled=%v max=%d", enabled, max)
+	}
+	enabled, max = autoRepairSettings(Config{}, true, 2)
+	if !enabled || max != 2 {
+		t.Fatalf("flag auto-repair should enable with max 2, got enabled=%v max=%d", enabled, max)
+	}
+}
+
+func TestAutoRepairRetriesBeforeStopping(t *testing.T) {
+	dir := t.TempDir()
+	oldwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := os.Chdir(oldwd); err != nil {
+			t.Fatal(err)
+		}
+	}()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(".rp/runs", 0755); err != nil {
+		t.Fatal(err)
+	}
+	planner := []byte(`version: rp.dev/v0.1
+capabilities:
+  fail_cmd:
+    purpose: observe
+    kind: command
+    inputs: {}
+    outputs:
+      result:
+        type: CommandResult
+        assertions:
+          - subject: result
+            predicate: completed
+            confidence: observed
+            when:
+              exit_code: 0
+    command:
+      cwd: "."
+      argv: [/bin/sh, -c, "exit 7"]
+    always_record_result: true
+    effects:
+      external: local_process
+      filesystem:
+        writes: []
+goals:
+  smoke:
+    requires_evidence:
+      - subject: result
+        predicate: completed
+        min_confidence: observed
+policies:
+  local_safe:
+    permissions: {}
+defaults:
+  policy: local_safe
+`)
+	if err := os.WriteFile(".rp/planner.yaml", planner, 0644); err != nil {
+		t.Fatal(err)
+	}
+	err = run([]string{"achieve", "smoke", "--auto-repair", "--max-attempts", "2"})
+	if err == nil {
+		t.Fatal("expected achieve to fail after retries exhausted")
+	}
+	runDir, err := latestRunDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	events, err := readEvents(runDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repairAttempts := 0
+	failCmdRuns := 0
+	for _, ev := range events {
+		if ev.Type == "auto_repair_attempted" {
+			repairAttempts++
+		}
+		if ev.Type == "action_started" && ev.Data["capability"] == "fail_cmd" {
+			failCmdRuns++
+		}
+	}
+	if repairAttempts != 1 {
+		t.Fatalf("expected one auto_repair_attempted event, got %d", repairAttempts)
+	}
+	if failCmdRuns != 2 {
+		t.Fatalf("expected fail_cmd to run twice with max-attempts 2, got %d runs", failCmdRuns)
+	}
+}
+
 func TestReplayPrintsNarrative(t *testing.T) {
 	dir := t.TempDir()
 	runDir := filepath.Join(dir, ".rp", "runs", "run-test")

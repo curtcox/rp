@@ -1,0 +1,59 @@
+version: rp.dev/v0.1
+policies:
+  local_safe:
+    description: Local-only development policy with conservative trust defaults.
+    permissions:
+      filesystem:
+        read: allowed
+        write: approval_required
+        destructive_write: approval_required
+      process:
+        execute: allowed
+      network:
+        access: forbidden
+      credentials:
+        use: forbidden
+      external_side_effects:
+        create_pull_request: forbidden
+        send_message: forbidden
+        deploy: forbidden
+    environment:
+      inherit: false
+      allow:
+        - PATH
+        - HOME
+    evidence:
+      confidence_order:
+        - unsupported
+        - claimed
+        - observed
+        - attested
+        - reproduced
+        - independently_reproduced
+      source_limits:
+        - source_type: llm_claim
+          max_confidence: claimed
+      final_goal_rules:
+        - source_type: llm_claim
+          may_satisfy_required_evidence: false
+    hashing:
+      file_backed_realizations: true
+      command_stdout: true
+      command_stderr: true
+      directories: false
+      credentials: false
+    execution:
+      on_failure: stop_and_suggest
+      auto_repair:
+        enabled: false
+        max_attempts: 1
+      plan_changes:
+        allow_without_confirmation_if_not_increasing:
+          - permissions
+          - risk
+          - cost_class
+    max_cost:
+      time: 10m
+      money_usd: 0
+      tokens: 0
+      human_attention: low

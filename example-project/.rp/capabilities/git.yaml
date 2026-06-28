@@ -1,0 +1,38 @@
+version: rp.dev/v0.1
+capabilities:
+  observe_git_status:
+    purpose: observe
+    kind: command
+    inputs:
+      repo:
+        type: GitRepo
+    outputs:
+      status:
+        type: CommandResult
+        assertions:
+          - subject: repo
+            predicate: clean_worktree
+            confidence: observed
+            when:
+              exit_code: 0
+              stdout_matches: "^$"
+            evidence_source: process_exit
+    command:
+      cwd: "${inputs.repo.path}"
+      argv:
+        - git
+        - status
+        - --porcelain
+    effects:
+      external: local_process
+      planner: append_only
+      filesystem:
+        writes: []
+    nondeterminism:
+      - external_process
+    idempotence: idempotent
+    cost:
+      time: cheap
+      money_usd: 0
+      risk: low
+      human_attention: none

@@ -29,7 +29,7 @@ Implemented commands include:
 - `add resource`, `resources`, `resource`
 - `plan` with `text`, `json`, `dot`, and `mermaid` output plus saved plan snapshots
 - `exec` for saved plan execution
-- `achieve` with `--dry-run`, `--step`, and `--yes`
+- `achieve` with `--dry-run`, `--step`, `--yes`, `--auto-repair`, and `--max-attempts`
 - `evidence`, `why`, `trace`, `audit`, `replay`, `replan`, and `rerun`
 - manual `observe`, `attest`, and `add assertion`
 
@@ -38,7 +38,9 @@ declared fields (unknown keys are rejected unless prefixed with `x-`), merges an
 optional user policy from `~/.config/rp/policy.yaml` (most-restrictive wins),
 computes a canonical JSON config hash, plans backward from goals with just-in-time
 replanning during `achieve`, executes command capabilities serially with
-execution-time precondition checks, writes artifacts under
+execution-time precondition checks, supports `--auto-repair` retries governed by
+policy `execution.auto_repair`, records assertion supersession when evidence is
+corrected, writes artifacts under
 `.rp/runs/<run-id>/artifacts`, records append-only JSONL events (including
 `action_failed` for non-zero exits when `always_record_result` is set), and
 explains assertions from the latest run. Use `rp replay RUN_ID` for a narrative
