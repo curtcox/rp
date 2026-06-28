@@ -174,13 +174,14 @@ type RunContext struct {
 }
 
 type AssertionRecord struct {
-	ID         string `json:"id"`
-	Subject    string `json:"subject"`
-	Predicate  string `json:"predicate"`
-	Object     string `json:"object,omitempty"`
-	Confidence string `json:"confidence"`
-	EvidenceID string `json:"evidence_id"`
-	ActionID   string `json:"action_id"`
+	ID             string `json:"id"`
+	Subject        string `json:"subject"`
+	Predicate      string `json:"predicate"`
+	Object         string `json:"object,omitempty"`
+	Confidence     string `json:"confidence"`
+	EvidenceID     string `json:"evidence_id"`
+	EvidenceSource string `json:"evidence_source"`
+	ActionID       string `json:"action_id"`
 }
 
 func main() {
@@ -517,6 +518,11 @@ func cmdAchieve(args []string) error {
 			return errors.New("stopped by user")
 		}
 		capability := cfg.Capabilities[step.Capability]
+		if err := checkCapabilityPolicy(cfg, capability); err != nil {
+			appendEvent(ctx, "run_stopped", step.ID, map[string]interface{}{"reason": err.Error()})
+			writeSummary(ctx, goalName, false, err.Error())
+			return err
+		}
 		if needsWriteApproval(cfg, capability) && !*yes {
 			appendEvent(ctx, "approval_requested", step.ID, map[string]interface{}{"permission": "filesystem.write"})
 			if !ask("approve filesystem write for " + step.Capability + "?") {
@@ -592,7 +598,7 @@ func cmdWhy(args []string) error {
 		fmt.Printf("%s.%s is unsupported in latest run %s\n", subject, predicate, filepath.Base(runDir))
 		return nil
 	}
-	fmt.Printf("%s.%s is %s\nsupported by assertion %s from action %s and evidence %s\n", subject, predicate, best.Confidence, best.ID, best.ActionID, best.EvidenceID)
+	fmt.Printf("%s.%s is %s\nsupported by assertion %s from action %s and evidence %s (%s)\n", subject, predicate, best.Confidence, best.ID, best.ActionID, best.EvidenceID, best.EvidenceSource)
 	return nil
 }
 
@@ -863,10 +869,14 @@ func executeStep(ctx RunContext, cfg Config, step PlanStep, resources map[string
 		for _, as := range out.Assertions {
 			if assertionMatches(as, exitCode, stdout.String()) {
 				subj := resolveSubject(as.Subject, step)
+				evidenceSource := as.EvidenceSource
+				if evidenceSource == "" {
+					evidenceSource = "process_exit"
+				}
 				rec := AssertionRecord{
 					ID:      "as-" + actionID + "-" + safeName(subj+"-"+as.Predicate),
 					Subject: subj, Predicate: as.Predicate, Object: as.Object,
-					Confidence: as.Confidence, EvidenceID: evidenceID, ActionID: actionID,
+					Confidence: as.Confidence, EvidenceID: evidenceID, EvidenceSource: evidenceSource, ActionID: actionID,
 				}
 				appendEvent(ctx, "assertion_recorded", actionID, structToMap(rec))
 			}
@@ -961,7 +971,7 @@ func goalSatisfied(runDir string, goal Goal) bool {
 	for _, req := range goal.RequiresEvidence {
 		ok := false
 		for _, as := range assertions {
-			if as.Subject == req.Subject && as.Predicate == req.Predicate && confidenceAtLeast(as.Confidence, req.MinConfidence) {
+			if as.Subject == req.Subject && as.Predicate == req.Predicate && confidenceAtLeast(as.Confidence, req.MinConfidence) && sourceAllowed(as.EvidenceSource, req.AnySourceType) {
 				ok = true
 			}
 		}
@@ -1048,14 +1058,57 @@ func findAssertionCapability(cfg Config, subject, predicate string) string {
 	return ""
 }
 
+func checkCapabilityPolicy(cfg Config, cap Capability) error {
+	policyName := cfg.Defaults["policy"]
+	pol := cfg.Policies[policyName]
+	networkAccess := permissionValue(pol.Permissions, "network", "access")
+	if networkAccess == "" {
+		networkAccess = "forbidden"
+	}
+	if networkAccess == "forbidden" && declaresNetworkEffect(cap) {
+		return errors.New("policy forbids network access")
+	}
+	credentialUse := permissionValue(pol.Permissions, "credentials", "use")
+	if credentialUse == "" {
+		credentialUse = "forbidden"
+	}
+	if credentialUse == "forbidden" && declaresCredentialUse(cap) {
+		return errors.New("policy forbids credential use")
+	}
+	return nil
+}
+
+func declaresNetworkEffect(cap Capability) bool {
+	if len(cap.Effects.Network) > 0 {
+		return true
+	}
+	return strings.Contains(strings.ToLower(cap.Effects.External), "network")
+}
+
+func declaresCredentialUse(cap Capability) bool {
+	return strings.Contains(strings.ToLower(cap.Effects.External), "credential")
+}
+
 func needsWriteApproval(cfg Config, cap Capability) bool {
 	if len(cap.Effects.Filesystem["writes"]) == 0 {
 		return false
 	}
 	policyName := cfg.Defaults["policy"]
 	pol := cfg.Policies[policyName]
-	fsPerm, _ := pol.Permissions["filesystem"].(map[string]interface{})
-	return fsPerm["write"] == "approval_required"
+	return permissionValue(pol.Permissions, "filesystem", "write") == "approval_required"
+}
+
+func permissionValue(permissions map[string]interface{}, section, key string) string {
+	rawSection, ok := permissions[section]
+	if !ok {
+		return ""
+	}
+	values, ok := rawSection.(map[string]interface{})
+	if !ok {
+		return ""
+	}
+	value, _ := values[key].(string)
+	return value
 }
 
 func environmentFor(cfg Config) []string {
@@ -1227,6 +1280,18 @@ func sha(b []byte) string {
 
 func confidenceAtLeast(got, min string) bool {
 	return confidenceRank[got] >= confidenceRank[min]
+}
+
+func sourceAllowed(got string, allowed []string) bool {
+	if len(allowed) == 0 {
+		return true
+	}
+	for _, source := range allowed {
+		if got == source {
+			return true
+		}
+	}
+	return false
 }
 
 func intFromAny(v interface{}) int {
