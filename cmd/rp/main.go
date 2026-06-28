@@ -219,10 +219,20 @@ func run(args []string) error {
 		return cmdEvidence(args[1:])
 	case "why":
 		return cmdWhy(args[1:])
+	case "trace":
+		return cmdTrace(args[1:])
+	case "observe":
+		return cmdObserve(args[1:])
+	case "attest":
+		return cmdAttest(args[1:])
 	case "audit", "replay":
 		return cmdAudit(args[1:])
 	case "replan":
 		return cmdReplan(args[1:])
+	case "rerun":
+		return cmdRerun(args[1:])
+	case "exec":
+		return cmdExec(args[1:])
 	case "version":
 		fmt.Println("rp", version)
 		return nil
@@ -246,9 +256,14 @@ Usage:
   rp achieve GOAL [--dry-run] [--step] [--yes]
   rp evidence GOAL
   rp why SUBJECT.PREDICATE
+  rp trace QUERY
+  rp observe RESOURCE --with git_status
+  rp attest SUBJECT.PREDICATE --source SOURCE [--note NOTE]
+  rp add assertion SUBJECT.PREDICATE [--subject SUBJECT] [--confidence LEVEL]
   rp audit RUN_ID
   rp replay RUN_ID
-  rp replan RUN_ID`)
+  rp replan RUN_ID
+  rp rerun RUN_ID`)
 }
 
 func cmdInit(args []string) error {
@@ -365,8 +380,11 @@ policies:
 }
 
 func cmdAdd(args []string) error {
+	if len(args) > 0 && args[0] == "assertion" {
+		return cmdAddAssertion(args[1:])
+	}
 	if len(args) < 2 || args[0] != "resource" {
-		return errors.New("usage: rp add resource NAME --type TYPE (--uri URI | --file PATH) [--media-type TYPE]")
+		return errors.New("usage: rp add resource NAME --type TYPE (--uri URI | --file PATH) [--media-type TYPE] OR rp add assertion SUBJECT.PREDICATE")
 	}
 	fs := flag.NewFlagSet("add resource", flag.ContinueOnError)
 	typ := fs.String("type", "", "resource type")
@@ -401,6 +419,26 @@ func cmdAdd(args []string) error {
 		ID: name + ".local", Kind: kind, URI: actualURI, MediaType: *media,
 	}}}
 	return writeYAML(path, cfg)
+}
+
+func cmdAddAssertion(args []string) error {
+	fs := flag.NewFlagSet("add assertion", flag.ContinueOnError)
+	subjectFlag := fs.String("subject", "", "assertion subject override")
+	object := fs.String("object", "", "assertion object")
+	confidence := fs.String("confidence", "claimed", "confidence level")
+	source := fs.String("source", "manual_entry", "evidence source type")
+	note := fs.String("note", "", "note")
+	if err := fs.Parse(normalizeFlagArgs(args, map[string]bool{"subject": true, "object": true, "confidence": true, "source": true, "note": true}, map[string]bool{})); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		return errors.New("usage: rp add assertion SUBJECT.PREDICATE [--subject SUBJECT] [--confidence LEVEL]")
+	}
+	subject, predicate, err := parseAssertionTarget(fs.Arg(0), *subjectFlag)
+	if err != nil {
+		return err
+	}
+	return appendManualAssertion(subject, predicate, *object, *confidence, *source, *note, "manual-assertion")
 }
 
 func cmdResources(args []string) error {
@@ -602,6 +640,121 @@ func cmdWhy(args []string) error {
 	return nil
 }
 
+func cmdTrace(args []string) error {
+	if len(args) != 1 {
+		return errors.New("usage: rp trace QUERY")
+	}
+	runDir, err := latestRunDir()
+	if err != nil {
+		return err
+	}
+	events, err := readEvents(runDir)
+	if err != nil {
+		return err
+	}
+	query := args[0]
+	found := false
+	for _, ev := range events {
+		if eventMatches(ev, query) {
+			found = true
+			b, _ := json.MarshalIndent(ev, "", "  ")
+			fmt.Println(string(b))
+		}
+	}
+	if !found {
+		fmt.Printf("no trace entries for %q in latest run %s\n", query, filepath.Base(runDir))
+	}
+	return nil
+}
+
+func cmdObserve(args []string) error {
+	fs := flag.NewFlagSet("observe", flag.ContinueOnError)
+	with := fs.String("with", "", "observer")
+	if err := fs.Parse(normalizeFlagArgs(args, map[string]bool{"with": true}, map[string]bool{})); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 || *with == "" {
+		return errors.New("usage: rp observe RESOURCE --with git_status")
+	}
+	if *with != "git_status" {
+		return fmt.Errorf("unsupported observer %q", *with)
+	}
+	root, cfg, configHash, err := loadProject()
+	if err != nil {
+		return err
+	}
+	res, ok := cfg.Resources[fs.Arg(0)]
+	if !ok {
+		return fmt.Errorf("resource %q not found", fs.Arg(0))
+	}
+	path := pathFromURI(root, realizationURI(res))
+	cmd := exec.Command("git", "status", "--porcelain")
+	cmd.Dir = path
+	cmd.Env = environmentFor(cfg)
+	var stdout, stderr bytes.Buffer
+	err = cmd.Run()
+	exitCode := 0
+	if err != nil {
+		if ee := new(exec.ExitError); errors.As(err, &ee) {
+			exitCode = ee.ExitCode()
+		} else {
+			exitCode = -1
+		}
+	}
+	ctx, err := newManualRun(root, configHash, hashPolicy(cfg), "observe "+fs.Arg(0)+" with git_status")
+	if err != nil {
+		return err
+	}
+	defer ctx.Events.Close()
+	actionID := "manual-observe-" + safeName(fs.Arg(0)+"-git-status")
+	obsID := "obs-" + actionID
+	evidenceID := "ev-" + actionID
+	appendEvent(ctx, "action_started", actionID, map[string]interface{}{"observer": "git_status", "resource": fs.Arg(0)})
+	appendEvent(ctx, "observation_recorded", actionID, map[string]interface{}{
+		"id": obsID, "source_type": "process_exit", "exit_code": exitCode,
+		"stdout_sha256": sha(stdout.Bytes()), "stderr_sha256": sha(stderr.Bytes()),
+	})
+	appendEvent(ctx, "evidence_recorded", actionID, map[string]interface{}{
+		"id": evidenceID, "source_type": "process_exit", "observation_id": obsID,
+		"confidence_contribution": "observed",
+	})
+	if exitCode == 0 && stdout.Len() == 0 {
+		rec := AssertionRecord{
+			ID: "as-" + actionID + "-clean-worktree", Subject: fs.Arg(0), Predicate: "clean_worktree",
+			Confidence: "observed", EvidenceID: evidenceID, EvidenceSource: "process_exit", ActionID: actionID,
+		}
+		appendEvent(ctx, "assertion_recorded", actionID, structToMap(rec))
+	}
+	appendEvent(ctx, "action_completed", actionID, map[string]interface{}{"exit_code": exitCode})
+	if err := writeSummary(ctx, "manual_observe", exitCode == 0, "manual git_status observation recorded"); err != nil {
+		return err
+	}
+	fmt.Println(ctx.RunDir)
+	if exitCode != 0 {
+		return fmt.Errorf("git_status observer failed with exit code %d", exitCode)
+	}
+	return nil
+}
+
+func cmdAttest(args []string) error {
+	fs := flag.NewFlagSet("attest", flag.ContinueOnError)
+	subjectFlag := fs.String("subject", "", "assertion subject override")
+	source := fs.String("source", "human_review", "evidence source type")
+	note := fs.String("note", "", "note")
+	confidence := fs.String("confidence", "attested", "confidence level")
+	if err := fs.Parse(normalizeFlagArgs(args, map[string]bool{"subject": true, "source": true, "note": true, "confidence": true}, map[string]bool{})); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		return errors.New("usage: rp attest SUBJECT.PREDICATE --source SOURCE [--note NOTE]")
+	}
+	subject, predicate, err := parseAssertionTarget(fs.Arg(0), *subjectFlag)
+	if err != nil {
+		return err
+	}
+	return appendManualAssertion(subject, predicate, "", *confidence, *source, *note, "manual-attestation")
+}
+
 func cmdAudit(args []string) error {
 	if len(args) != 1 {
 		return errors.New("usage: rp audit RUN_ID")
@@ -635,6 +788,24 @@ func cmdReplan(args []string) error {
 		return errors.New("run summary has no goal")
 	}
 	return cmdPlan([]string{"--explain", goal})
+}
+
+func cmdRerun(args []string) error {
+	if len(args) != 1 {
+		return errors.New("usage: rp rerun RUN_ID")
+	}
+	goal, err := goalFromRun(args[0])
+	if err != nil {
+		return err
+	}
+	return cmdAchieve([]string{goal})
+}
+
+func cmdExec(args []string) error {
+	if len(args) != 1 {
+		return errors.New("usage: rp exec PLAN_ID")
+	}
+	return errors.New("saved plan execution is reserved in v0.1; use rp achieve GOAL or rp rerun RUN_ID")
 }
 
 func loadProject() (string, Config, string, error) {
@@ -951,6 +1122,15 @@ func newRun(root, configHash, policyHash string) (RunContext, error) {
 	return RunContext{Root: root, RPDir: filepath.Join(root, ".rp"), RunID: runID, RunDir: runDir, Artifacts: artifacts, ConfigHash: configHash, PolicyHash: policyHash, Events: f}, nil
 }
 
+func newManualRun(root, configHash, policyHash, reason string) (RunContext, error) {
+	ctx, err := newRun(root, configHash, policyHash)
+	if err != nil {
+		return RunContext{}, err
+	}
+	appendEvent(ctx, "run_started", "", map[string]interface{}{"goal": "manual", "config_hash": configHash, "reason": reason})
+	return ctx, nil
+}
+
 func appendEvent(ctx RunContext, typ, actionID string, data map[string]interface{}) {
 	ev := Event{Type: typ, Time: time.Now().UTC().Format(time.RFC3339Nano), RunID: ctx.RunID, ActionID: actionID, Data: data}
 	b, _ := json.Marshal(ev)
@@ -961,6 +1141,23 @@ func writeSummary(ctx RunContext, goal string, satisfied bool, reason string) er
 	summary := map[string]interface{}{"run_id": ctx.RunID, "goal": goal, "satisfied": satisfied, "reason": reason, "config_hash": ctx.ConfigHash, "policy_hash": ctx.PolicyHash}
 	b, _ := json.MarshalIndent(summary, "", "  ")
 	return os.WriteFile(filepath.Join(ctx.RunDir, "summary.json"), append(b, '\n'), 0644)
+}
+
+func goalFromRun(runID string) (string, error) {
+	summaryPath := filepath.Join(".rp", "runs", runID, "summary.json")
+	b, err := os.ReadFile(summaryPath)
+	if err != nil {
+		return "", err
+	}
+	var summary map[string]interface{}
+	if err := json.Unmarshal(b, &summary); err != nil {
+		return "", err
+	}
+	goal, _ := summary["goal"].(string)
+	if goal == "" || strings.HasPrefix(goal, "manual_") || goal == "manual" {
+		return "", errors.New("run summary has no rerunnable goal")
+	}
+	return goal, nil
 }
 
 func goalSatisfied(runDir string, goal Goal) bool {
@@ -1017,6 +1214,83 @@ func readEvents(runDir string) ([]Event, error) {
 		events = append(events, ev)
 	}
 	return events, scanner.Err()
+}
+
+func appendManualAssertion(subject, predicate, object, confidence, source, note, actionID string) error {
+	if !knownConfidence(confidence) {
+		return fmt.Errorf("unknown confidence %q", confidence)
+	}
+	root, cfg, configHash, err := loadProject()
+	if err != nil {
+		return err
+	}
+	ctx, err := newManualRun(root, configHash, hashPolicy(cfg), "manual assertion")
+	if err != nil {
+		return err
+	}
+	defer ctx.Events.Close()
+	actionID = actionID + "-" + safeName(subject+"-"+predicate)
+	obsID := "obs-" + actionID
+	evidenceID := "ev-" + actionID
+	appendEvent(ctx, "action_started", actionID, map[string]interface{}{"manual": true})
+	appendEvent(ctx, "observation_recorded", actionID, map[string]interface{}{
+		"id": obsID, "source_type": source, "note": note,
+	})
+	appendEvent(ctx, "evidence_recorded", actionID, map[string]interface{}{
+		"id": evidenceID, "source_type": source, "observation_id": obsID,
+		"confidence_contribution": confidence,
+	})
+	rec := AssertionRecord{
+		ID: "as-" + actionID, Subject: subject, Predicate: predicate, Object: object,
+		Confidence: confidence, EvidenceID: evidenceID, EvidenceSource: source, ActionID: actionID,
+	}
+	appendEvent(ctx, "assertion_recorded", actionID, structToMap(rec))
+	appendEvent(ctx, "attestation_recorded", actionID, map[string]interface{}{
+		"id": "att-" + actionID, "assertion_ids": []string{rec.ID}, "evidence_ids": []string{evidenceID},
+		"config_hash": ctx.ConfigHash, "policy_hash": ctx.PolicyHash, "run_id": ctx.RunID,
+	})
+	appendEvent(ctx, "action_completed", actionID, map[string]interface{}{"manual": true})
+	if err := writeSummary(ctx, "manual_assertion", true, "manual assertion recorded"); err != nil {
+		return err
+	}
+	fmt.Println(ctx.RunDir)
+	return nil
+}
+
+func parseAssertionTarget(expr, subjectOverride string) (string, string, error) {
+	subject, predicate, ok := strings.Cut(expr, ".")
+	if subjectOverride != "" {
+		if ok {
+			predicate = predicatePart(predicate)
+		} else {
+			predicate = expr
+		}
+		return subjectOverride, predicate, nil
+	}
+	if ok {
+		return subject, predicatePart(predicate), nil
+	}
+	return expr, "attested", nil
+}
+
+func predicatePart(predicate string) string {
+	if predicate == "" {
+		return "attested"
+	}
+	return predicate
+}
+
+func knownConfidence(confidence string) bool {
+	_, ok := confidenceRank[confidence]
+	return ok
+}
+
+func eventMatches(ev Event, query string) bool {
+	if strings.Contains(ev.Type, query) || strings.Contains(ev.ActionID, query) || strings.Contains(ev.RunID, query) {
+		return true
+	}
+	b, _ := json.Marshal(ev.Data)
+	return strings.Contains(string(b), query) || strings.Contains(filepath.Base(string(b)), query)
 }
 
 func latestRunDir() (string, error) {

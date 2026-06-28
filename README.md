@@ -13,6 +13,9 @@ go run ./cmd/rp plan bugfix_patch --explain
 go run ./cmd/rp achieve bugfix_patch --yes
 go run ./cmd/rp evidence bugfix_patch
 go run ./cmd/rp why patched_repo.tests_pass
+go run ./cmd/rp trace proposed.patch
+go run ./cmd/rp observe repo --with git_status
+go run ./cmd/rp attest patched_repo.tests_pass --source human_review --note "reviewed"
 ```
 
 Implemented commands include:
@@ -24,7 +27,8 @@ Implemented commands include:
 - `add resource`, `resources`, `resource`
 - `plan` with `text`, `json`, `dot`, and `mermaid` output
 - `achieve` with `--dry-run`, `--step`, and `--yes`
-- `evidence`, `why`, `audit`, `replay`, and `replan`
+- `evidence`, `why`, `trace`, `audit`, `replay`, `replan`, and `rerun`
+- manual `observe`, `attest`, and `add assertion`
 
 The runtime loads project-local `.rp/` YAML, resolves local imports, computes a
 canonical JSON config hash, executes command capabilities serially, writes

@@ -77,3 +77,74 @@ func TestGoalSatisfiedHonorsAllowedEvidenceSources(t *testing.T) {
 		t.Fatal("matching source should satisfy requirement")
 	}
 }
+
+func TestParseAssertionTarget(t *testing.T) {
+	subject, predicate, err := parseAssertionTarget("patch.addresses_bug", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if subject != "patch" || predicate != "addresses_bug" {
+		t.Fatalf("unexpected target: %s.%s", subject, predicate)
+	}
+	subject, predicate, err = parseAssertionTarget("tests_pass", "patched_repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if subject != "patched_repo" || predicate != "tests_pass" {
+		t.Fatalf("unexpected override target: %s.%s", subject, predicate)
+	}
+}
+
+func TestAppendManualAssertionCreatesRunEvidence(t *testing.T) {
+	dir := t.TempDir()
+	oldwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := os.Chdir(oldwd); err != nil {
+			t.Fatal(err)
+		}
+	}()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(".rp", "runs"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	planner := []byte(`version: rp.dev/v0.1
+resources: {}
+policies:
+  local_safe:
+    permissions: {}
+defaults:
+  policy: local_safe
+`)
+	if err := os.WriteFile(filepath.Join(".rp", "planner.yaml"), planner, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := appendManualAssertion("patch", "addresses_bug", "", "claimed", "human_review", "looks right", "manual-test"); err != nil {
+		t.Fatal(err)
+	}
+	runDir, err := latestRunDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertions, err := assertionsFromRun(runDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(assertions) != 1 {
+		t.Fatalf("expected one assertion, got %d", len(assertions))
+	}
+	if assertions[0].Subject != "patch" || assertions[0].Predicate != "addresses_bug" || assertions[0].EvidenceSource != "human_review" {
+		t.Fatalf("unexpected assertion: %+v", assertions[0])
+	}
+	events, err := readEvents(runDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !eventMatches(events[len(events)-1], "manual-test") {
+		t.Fatal("expected trace matching for manual action")
+	}
+}
