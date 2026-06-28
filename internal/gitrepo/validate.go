@@ -1,3 +1,5 @@
+// Package gitrepo validates that GitRepo resources are independent git
+// repositories before they are used by the planner.
 package gitrepo
 
 import (

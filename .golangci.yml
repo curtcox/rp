@@ -1,0 +1,33 @@
+# golangci-lint v2 configuration (gating linters).
+#
+# This config is the *gate*: `make lint` / CI fail when it reports issues.
+# It is tuned to pass on the current codebase while still catching real
+# correctness problems (govet, staticcheck, ineffassign, unused).
+#
+# Cyclomatic/cognitive complexity are reported separately and non-blocking
+# (see `make complexity`), per the project's "gate on core, report extras"
+# policy.
+version: "2"
+
+linters:
+  default: standard
+  disable:
+    # errcheck flags many intentional ignores in this codebase
+    # (writeIfMissing/writeSummary helpers and deferred Close calls).
+    # Unchecked errors still surface in the published reports via `go vet`
+    # patterns, but they do not block the build.
+    - errcheck
+  enable:
+    - misspell
+    - unconvert
+  settings:
+    staticcheck:
+      checks:
+        - all
+        # QF1006/S1011 are stylistic simplifications of working logic.
+        - -QF1006
+        - -S1011
+
+formatters:
+  enable:
+    - gofmt

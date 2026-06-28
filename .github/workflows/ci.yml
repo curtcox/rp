@@ -1,0 +1,82 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # Gating suite: tests + gofmt + go vet + golangci-lint.
+  # Mirrors `make check` so local and CI behavior match.
+  checks:
+    name: tests & static analysis
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: true
+
+      - name: Install analysis tools
+        run: make tools
+
+      - name: Add GOBIN to PATH
+        run: echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: Gating checks (gofmt, vet, lint, test)
+        run: make check
+
+      - name: Tests with race detector
+        run: make test-race
+
+  # Build the HTML report site and publish it to GitHub Pages.
+  # Runs independently of `checks` so the published dashboard always reflects
+  # the true state of main (including failing tests / lint findings).
+  pages:
+    name: publish reports to Pages
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    concurrency:
+      group: pages
+      cancel-in-progress: true
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: true
+
+      - name: Install analysis tools
+        run: make tools
+
+      - name: Add GOBIN to PATH
+        run: echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: Build report site
+        run: make reports
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+      - name: Deploy to GitHub Pages
+        id: deploy
+        uses: actions/deploy-pages@v4

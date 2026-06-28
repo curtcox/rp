@@ -1,3 +1,5 @@
+// Package model defines the core types and helpers shared across the rp
+// planner: resources, capabilities, goals, plans, events, and run state.
 package model
 
 import "os"

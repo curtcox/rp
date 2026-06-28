@@ -27,26 +27,26 @@ import (
 const version = model.Version
 
 type (
-	Config          = model.Config
-	Resource        = model.Resource
-	Realization     = model.Realization
-	Capability      = model.Capability
-	InputSpec       = model.InputSpec
-	Requirement     = model.Requirement
-	OutputSpec      = model.OutputSpec
-	AssertionSpec   = model.AssertionSpec
-	CommandSpec     = model.CommandSpec
-	StreamSpec      = model.StreamSpec
-	SaveAsSpec      = model.SaveAsSpec
-	EffectSpec      = model.EffectSpec
-	Policy          = model.Policy
-	Goal            = model.Goal
-	PlanStep        = model.PlanStep
-	SavedPlan       = model.SavedPlan
-	Event           = model.Event
-	RunContext      = model.RunContext
-	AssertionRecord = model.AssertionRecord
-	ProduceRecord   = model.ProduceRecord
+	Config            = model.Config
+	Resource          = model.Resource
+	Realization       = model.Realization
+	Capability        = model.Capability
+	InputSpec         = model.InputSpec
+	Requirement       = model.Requirement
+	OutputSpec        = model.OutputSpec
+	AssertionSpec     = model.AssertionSpec
+	CommandSpec       = model.CommandSpec
+	StreamSpec        = model.StreamSpec
+	SaveAsSpec        = model.SaveAsSpec
+	EffectSpec        = model.EffectSpec
+	Policy            = model.Policy
+	Goal              = model.Goal
+	PlanStep          = model.PlanStep
+	SavedPlan         = model.SavedPlan
+	Event             = model.Event
+	RunContext        = model.RunContext
+	AssertionRecord   = model.AssertionRecord
+	ProduceRecord     = model.ProduceRecord
 	PlanEffectSummary = model.PlanEffectSummary
 )
 
@@ -521,7 +521,7 @@ func runPlan(root string, cfg Config, configHash, goalName string, plan []PlanSt
 			newCaps := planCapabilities(steps)
 			if stepNum > 0 && !sameCapabilities(lastPlanCaps, newCaps) {
 				if confirm, reason := planRevisionNeedsConfirmation(cfg, lastPlanCaps, newCaps); confirm && !yes {
-					if !ask("plan revised ("+reason+"), continue?") {
+					if !ask("plan revised (" + reason + "), continue?") {
 						appendEvent(ctx, "run_stopped", "", map[string]interface{}{"reason": "plan revision denied"})
 						return errors.New("plan revision denied")
 					}
@@ -575,7 +575,7 @@ func runPlan(root string, cfg Config, configHash, goalName string, plan []PlanSt
 		}
 		if perm := capabilityApprovalPermission(cfg, capability); perm != "" && !yes {
 			appendEvent(ctx, "approval_requested", step.ID, map[string]interface{}{"permission": perm})
-			if !ask("approve "+perm+" for "+step.Capability+"?") {
+			if !ask("approve " + perm + " for " + step.Capability + "?") {
 				appendEvent(ctx, "approval_denied", step.ID, nil)
 				return errors.New("approval denied")
 			}
@@ -1175,9 +1175,9 @@ func loadUserPolicy() (Policy, bool, error) {
 		return Policy{}, false, err
 	}
 	var doc struct {
-		Version  string             `yaml:"version"`
-		Policies map[string]Policy  `yaml:"policies,omitempty"`
-		Policy   Policy             `yaml:"policy,omitempty"`
+		Version  string            `yaml:"version"`
+		Policies map[string]Policy `yaml:"policies,omitempty"`
+		Policy   Policy            `yaml:"policy,omitempty"`
 	}
 	if err := yaml.Unmarshal(b, &doc); err != nil {
 		return Policy{}, false, fmt.Errorf("%s: %w", path, err)

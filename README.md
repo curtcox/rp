@@ -1,6 +1,11 @@
 # rp
 
+[![CI](https://github.com/curtcox/rp/actions/workflows/ci.yml/badge.svg)](https://github.com/curtcox/rp/actions/workflows/ci.yml)
+
 A local, terminal-first, evidence-auditable resource planner.
+
+📊 **[Test & static-analysis reports](https://curtcox.github.io/rp/)** — coverage,
+golangci-lint, and complexity dashboards, published from `main` by CI.
 
 ## v0.1 CLI
 
@@ -101,3 +106,36 @@ policy:
 ```
 
 This layers on top of the project policy; the stricter permission wins.
+
+## Development
+
+All checks are driven by the [`Makefile`](Makefile) so that local runs and CI
+behave identically. Run `make help` to list targets.
+
+```sh
+make tools      # install pinned analysis tools (golangci-lint, gocyclo, gocognit)
+make check      # gating suite: gofmt + go vet + golangci-lint + go test
+make test       # run tests
+make coverage   # write coverage.out and print total coverage
+make complexity # cyclomatic (gocyclo) + cognitive (gocognit) complexity
+make reports    # build the HTML report site under ./site
+make clean      # remove generated artifacts
+```
+
+### Continuous integration
+
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) defines two jobs:
+
+- **checks** (every push and pull request) — runs `make check` plus the race
+  detector. This is the gate; lint findings, formatting drift, vet errors, or
+  test failures fail the build. Linting is configured in
+  [`.golangci.yml`](.golangci.yml).
+- **pages** (pushes to `main`) — builds the report site with `make reports` and
+  publishes it to **GitHub Pages** at <https://curtcox.github.io/rp/>. The
+  dashboard links to test output, the HTML coverage report, golangci-lint
+  results, and cyclomatic/cognitive complexity reports. Coverage and complexity
+  are informational (published, not gating).
+
+> [!NOTE]
+> Pages publishing requires the repository's **Settings → Pages → Build and
+> deployment → Source** to be set to **GitHub Actions** (one-time setup).

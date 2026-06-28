@@ -30,7 +30,7 @@ func TestBuildPlanBugfixOrdering(t *testing.T) {
 			},
 			"propose_patch_with_script": {
 				Purpose: "derive",
-				Inputs: map[string]InputSpec{"repo": {Requires: []Requirement{{Predicate: "clean_worktree"}}}},
+				Inputs:  map[string]InputSpec{"repo": {Requires: []Requirement{{Predicate: "clean_worktree"}}}},
 				Outputs: map[string]OutputSpec{"patch": {}},
 			},
 			"observe_git_status": {
@@ -72,9 +72,9 @@ func TestBuildPlanBugfixOrdering(t *testing.T) {
 
 func TestMergePoliciesMostRestrictive(t *testing.T) {
 	project := Policy{Permissions: map[string]interface{}{
-		"network":      map[string]interface{}{"access": "allowed"},
-		"filesystem":   map[string]interface{}{"write": "allowed"},
-		"credentials":  map[string]interface{}{"use": "forbidden"},
+		"network":     map[string]interface{}{"access": "allowed"},
+		"filesystem":  map[string]interface{}{"write": "allowed"},
+		"credentials": map[string]interface{}{"use": "forbidden"},
 	}}
 	user := Policy{Permissions: map[string]interface{}{
 		"network":    map[string]interface{}{"access": "forbidden"},
@@ -381,7 +381,7 @@ func TestNeedsWriteApprovalUsesPolicy(t *testing.T) {
 			},
 		}},
 	}
-	capability := Capability{Effects: EffectSpec{Filesystem: map[string][]string{"writes": []string{"out.txt"}}}}
+	capability := Capability{Effects: EffectSpec{Filesystem: map[string][]string{"writes": {"out.txt"}}}}
 	if !capabilityNeedsApproval(cfg, capability) {
 		t.Fatal("expected write approval")
 	}
@@ -1297,7 +1297,7 @@ func TestCapabilityDestructiveWriteApproval(t *testing.T) {
 	}
 	capability := Capability{
 		Idempotence: "non_idempotent",
-		Effects:     EffectSpec{Filesystem: map[string][]string{"writes": []string{"."}}},
+		Effects:     EffectSpec{Filesystem: map[string][]string{"writes": {"."}}},
 	}
 	if got := capabilityApprovalPermission(cfg, capability); got != "filesystem.destructive_write" {
 		t.Fatalf("expected destructive_write approval, got %q", got)
@@ -1311,8 +1311,8 @@ func TestValidatePlanMaxCostRejectsExpensivePlan(t *testing.T) {
 			MaxCost: map[string]interface{}{"time": "1m"},
 		}},
 		Capabilities: map[string]Capability{
-			"cheap":      {Cost: map[string]interface{}{"time": "cheap"}},
-			"expensive":  {Cost: map[string]interface{}{"time": "expensive"}},
+			"cheap":     {Cost: map[string]interface{}{"time": "cheap"}},
+			"expensive": {Cost: map[string]interface{}{"time": "expensive"}},
 		},
 	}
 	goal := Goal{Constraints: map[string]interface{}{
