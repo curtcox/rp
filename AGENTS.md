@@ -23,10 +23,13 @@ truth for *intent*, but the code may have drifted, so trust the code for
 
 - `cmd/rp/main.go` — the entire CLI: dispatch, planning, execution, evidence. ~3,500 lines. See `cmd/rp/AGENTS.md` for a function-group map.
 - `cmd/rp/main_test.go` — end-to-end tests driven through `run([]string)`.
+- `cmd/rp/doctest_test.go` — `TestDocExamples`: runs the `console` examples embedded in `docs/` and fails on drift (`make doctest`). Reuses `copyDir` from `main_test.go`.
 - `internal/model/` — core data types (`Config`, `Capability`, `Goal`, `Event`, ...) and the confidence ladder. **Types only, no logic.**
 - `internal/gitrepo/` — validates that `GitRepo` resources are independent git repos before execution.
 - `example-project/` — a **test fixture AND the tutorial** (the spec's Milestone 5 walkthrough). Do not "tidy" it; tests depend on its layout.
-- `scripts/gen-site.sh` — builds the HTML report site published to GitHub Pages.
+- `scripts/gen-site.sh` — builds the HTML site published to GitHub Pages (reports + docs).
+- `scripts/render-docs.py` — stdlib-only Markdown→HTML renderer for `docs/` (called by `gen-site.sh`).
+- `docs/` — prose documentation (Markdown). Its `console` examples are **runnable tests** (see `cmd/rp/doctest_test.go` and `docs/README.md`); `status=ready` blocks are executed and asserted, `status=todo` blocks are counted placeholders. Keep examples in sync with behavior, or `make doctest` fails.
 - `spec-v01.md` — design spec and glossary (intent, not a behavior contract).
 
 ## Glossary (domain terms)

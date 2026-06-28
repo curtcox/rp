@@ -4,8 +4,10 @@
 
 A local, terminal-first, evidence-auditable resource planner.
 
-📊 **[Test & static-analysis reports](https://curtcox.github.io/rp/)** — coverage,
-golangci-lint, and complexity dashboards, published from `main` by CI.
+📚 **[Documentation & reports](https://curtcox.github.io/rp/)** — full docs
+(getting started, CLI reference, concepts, config, tutorials) plus the coverage,
+golangci-lint, and complexity dashboards, published from `main` by CI. The docs
+source lives in [`docs/`](docs/); its examples are runnable tests (see below).
 
 ## v0.1 CLI
 
@@ -116,11 +118,23 @@ behave identically. Run `make help` to list targets.
 make tools      # install pinned analysis tools (golangci-lint, gocyclo, gocognit)
 make check      # gating suite: gofmt + go vet + golangci-lint + go test
 make test       # run tests
+make doctest    # run the runnable examples embedded in docs/
 make coverage   # write coverage.out and print total coverage
 make complexity # cyclomatic (gocyclo) + cognitive (gocognit) complexity
-make reports    # build the HTML report site under ./site
+make reports    # build the docs + report site under ./site
 make clean      # remove generated artifacts
 ```
+
+### Documentation
+
+Prose documentation lives in [`docs/`](docs/) as Markdown and is rendered to the
+published site by [`scripts/render-docs.py`](scripts/render-docs.py) (Python 3
+stdlib only — no extra toolchain). Examples in the docs are **runnable tests**:
+`cmd/rp/doctest_test.go` extracts the `console` blocks marked `status=ready`,
+runs them against a sandbox, normalizes volatile output, and fails on drift. Many
+examples ship as `status=todo` placeholders that are counted and reported, not
+silently ignored. Run them with `make doctest`; the convention is documented in
+[`docs/README.md`](docs/README.md).
 
 ### Continuous integration
 
@@ -130,11 +144,11 @@ make clean      # remove generated artifacts
   detector. This is the gate; lint findings, formatting drift, vet errors, or
   test failures fail the build. Linting is configured in
   [`.golangci.yml`](.golangci.yml).
-- **pages** (pushes to `main`) — builds the report site with `make reports` and
+- **pages** (pushes to `main`) — builds the site with `make reports` and
   publishes it to **GitHub Pages** at <https://curtcox.github.io/rp/>. The
-  dashboard links to test output, the HTML coverage report, golangci-lint
-  results, and cyclomatic/cognitive complexity reports. Coverage and complexity
-  are informational (published, not gating).
+  dashboard links to the rendered docs plus test output, the HTML coverage
+  report, golangci-lint results, and cyclomatic/cognitive complexity reports.
+  Coverage and complexity are informational (published, not gating).
 
 > [!NOTE]
 > Pages publishing requires the repository's **Settings → Pages → Build and
