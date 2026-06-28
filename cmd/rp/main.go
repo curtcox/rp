@@ -558,7 +558,7 @@ func cmdAchieve(args []string) error {
 		capability := cfg.Capabilities[step.Capability]
 		if err := checkCapabilityPolicy(cfg, capability); err != nil {
 			appendEvent(ctx, "run_stopped", step.ID, map[string]interface{}{"reason": err.Error()})
-			writeSummary(ctx, goalName, false, err.Error(), missingEvidence(ctx.RunDir, cfg.Goals[goalName]))
+			writeSummary(ctx, goalName, false, err.Error(), missingEvidenceWithConfig(ctx.RunDir, cfg.Goals[goalName], cfg))
 			return err
 		}
 		if needsWriteApproval(cfg, capability) && !*yes {
@@ -571,10 +571,10 @@ func cmdAchieve(args []string) error {
 		}
 		if err := executeStep(ctx, cfg, step, resources); err != nil {
 			appendEvent(ctx, "run_stopped", "", map[string]interface{}{"reason": err.Error()})
-			writeSummary(ctx, goalName, false, err.Error(), missingEvidence(ctx.RunDir, cfg.Goals[goalName]))
+			writeSummary(ctx, goalName, false, err.Error(), missingEvidenceWithConfig(ctx.RunDir, cfg.Goals[goalName], cfg))
 			return err
 		}
-		missing := missingEvidence(ctx.RunDir, cfg.Goals[goalName])
+		missing := missingEvidenceWithConfig(ctx.RunDir, cfg.Goals[goalName], cfg)
 		appendEvent(ctx, "goal_gap_evaluated", step.ID, map[string]interface{}{
 			"missing_count": len(missing),
 			"missing":       missing,
@@ -584,7 +584,7 @@ func cmdAchieve(args []string) error {
 			break
 		}
 	}
-	missing := missingEvidence(ctx.RunDir, cfg.Goals[goalName])
+	missing := missingEvidenceWithConfig(ctx.RunDir, cfg.Goals[goalName], cfg)
 	satisfied := len(missing) == 0
 	appendEvent(ctx, "goal_satisfied", "", map[string]interface{}{"satisfied": satisfied})
 	reason := "goal evidence requirements satisfied"
@@ -1056,10 +1056,11 @@ func executeStep(ctx RunContext, cfg Config, step PlanStep, resources map[string
 				if evidenceSource == "" {
 					evidenceSource = "process_exit"
 				}
+				confidence := capConfidenceByPolicy(cfg, evidenceSource, as.Confidence)
 				rec := AssertionRecord{
 					ID:      "as-" + actionID + "-" + safeName(subj+"-"+as.Predicate),
 					Subject: subj, Predicate: as.Predicate, Object: as.Object,
-					Confidence: as.Confidence, EvidenceID: evidenceID, EvidenceSource: evidenceSource, ActionID: actionID,
+					Confidence: confidence, EvidenceID: evidenceID, EvidenceSource: evidenceSource, ActionID: actionID,
 				}
 				appendEvent(ctx, "assertion_recorded", actionID, structToMap(rec))
 			}
@@ -1180,6 +1181,10 @@ func goalSatisfied(runDir string, goal Goal) bool {
 }
 
 func missingEvidence(runDir string, goal Goal) []Requirement {
+	return missingEvidenceWithConfig(runDir, goal, Config{})
+}
+
+func missingEvidenceWithConfig(runDir string, goal Goal, cfg Config) []Requirement {
 	assertions, err := assertionsFromRun(runDir)
 	if err != nil {
 		return goal.RequiresEvidence
@@ -1188,7 +1193,7 @@ func missingEvidence(runDir string, goal Goal) []Requirement {
 	for _, req := range goal.RequiresEvidence {
 		ok := false
 		for _, as := range assertions {
-			if as.Subject == req.Subject && as.Predicate == req.Predicate && confidenceAtLeast(as.Confidence, req.MinConfidence) && sourceAllowed(as.EvidenceSource, req.AnySourceType) {
+			if as.Subject == req.Subject && as.Predicate == req.Predicate && confidenceAtLeast(as.Confidence, req.MinConfidence) && sourceAllowed(as.EvidenceSource, req.AnySourceType) && sourceMaySatisfyRequiredEvidence(cfg, as.EvidenceSource) {
 				ok = true
 			}
 		}
@@ -1262,7 +1267,7 @@ func appendManualAssertion(subject, predicate, object, confidence, source, note,
 	})
 	rec := AssertionRecord{
 		ID: "as-" + actionID, Subject: subject, Predicate: predicate, Object: object,
-		Confidence: confidence, EvidenceID: evidenceID, EvidenceSource: source, ActionID: actionID,
+		Confidence: capConfidenceByPolicy(cfg, source, confidence), EvidenceID: evidenceID, EvidenceSource: source, ActionID: actionID,
 	}
 	appendEvent(ctx, "assertion_recorded", actionID, structToMap(rec))
 	appendEvent(ctx, "attestation_recorded", actionID, map[string]interface{}{
@@ -1494,6 +1499,69 @@ func hashPolicy(cfg Config) string {
 	name := cfg.Defaults["policy"]
 	b, _ := json.Marshal(cfg.Policies[name])
 	return sha(b)
+}
+
+func activePolicy(cfg Config) Policy {
+	return cfg.Policies[cfg.Defaults["policy"]]
+}
+
+func capConfidenceByPolicy(cfg Config, sourceType, confidence string) string {
+	maxConfidence := policySourceMaxConfidence(activePolicy(cfg), sourceType)
+	if maxConfidence == "" || confidenceAtLeast(maxConfidence, confidence) {
+		return confidence
+	}
+	return maxConfidence
+}
+
+func policySourceMaxConfidence(pol Policy, sourceType string) string {
+	for _, rule := range policyEvidenceRules(pol, "source_limits") {
+		if stringField(rule, "source_type") == sourceType {
+			if max := stringField(rule, "max_confidence"); knownConfidence(max) {
+				return max
+			}
+		}
+	}
+	return ""
+}
+
+func sourceMaySatisfyRequiredEvidence(cfg Config, sourceType string) bool {
+	pol := activePolicy(cfg)
+	for _, rule := range policyEvidenceRules(pol, "final_goal_rules") {
+		if stringField(rule, "source_type") == sourceType {
+			if may, ok := boolField(rule, "may_satisfy_required_evidence"); ok {
+				return may
+			}
+		}
+	}
+	return true
+}
+
+func policyEvidenceRules(pol Policy, key string) []map[string]interface{} {
+	raw, ok := pol.Evidence[key]
+	if !ok {
+		return nil
+	}
+	items, ok := raw.([]interface{})
+	if !ok {
+		return nil
+	}
+	var rules []map[string]interface{}
+	for _, item := range items {
+		if rule, ok := item.(map[string]interface{}); ok {
+			rules = append(rules, rule)
+		}
+	}
+	return rules
+}
+
+func stringField(m map[string]interface{}, key string) string {
+	v, _ := m[key].(string)
+	return v
+}
+
+func boolField(m map[string]interface{}, key string) (bool, bool) {
+	v, ok := m[key].(bool)
+	return v, ok
 }
 
 func writeIfMissing(path, body string) error {

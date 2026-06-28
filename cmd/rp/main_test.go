@@ -79,6 +79,54 @@ func TestGoalSatisfiedHonorsAllowedEvidenceSources(t *testing.T) {
 	}
 }
 
+func TestMissingEvidenceHonorsFinalGoalSourceRules(t *testing.T) {
+	runDir := t.TempDir()
+	events := []byte(`{"type":"assertion_recorded","data":{"id":"as-1","subject":"patch","predicate":"applies_cleanly","confidence":"observed","evidence_id":"ev-1","evidence_source":"llm_claim","action_id":"act-1"}}
+`)
+	if err := os.WriteFile(filepath.Join(runDir, "events.jsonl"), events, 0644); err != nil {
+		t.Fatal(err)
+	}
+	goal := Goal{RequiresEvidence: []Requirement{{
+		Subject: "patch", Predicate: "applies_cleanly", MinConfidence: "observed",
+	}}}
+	cfg := Config{
+		Defaults: map[string]string{"policy": "local_safe"},
+		Policies: map[string]Policy{"local_safe": {
+			Evidence: map[string]interface{}{
+				"final_goal_rules": []interface{}{
+					map[string]interface{}{"source_type": "llm_claim", "may_satisfy_required_evidence": false},
+				},
+			},
+		}},
+	}
+	if len(missingEvidenceWithConfig(runDir, goal, cfg)) != 1 {
+		t.Fatal("llm_claim should not satisfy final evidence when policy forbids it")
+	}
+	cfg.Policies["local_safe"] = Policy{}
+	if len(missingEvidenceWithConfig(runDir, goal, cfg)) != 0 {
+		t.Fatal("same assertion should satisfy evidence without a forbidding final goal rule")
+	}
+}
+
+func TestPolicySourceLimitsCapConfidence(t *testing.T) {
+	cfg := Config{
+		Defaults: map[string]string{"policy": "local_safe"},
+		Policies: map[string]Policy{"local_safe": {
+			Evidence: map[string]interface{}{
+				"source_limits": []interface{}{
+					map[string]interface{}{"source_type": "llm_claim", "max_confidence": "claimed"},
+				},
+			},
+		}},
+	}
+	if got := capConfidenceByPolicy(cfg, "llm_claim", "observed"); got != "claimed" {
+		t.Fatalf("expected llm_claim confidence to be capped at claimed, got %q", got)
+	}
+	if got := capConfidenceByPolicy(cfg, "process_exit", "observed"); got != "observed" {
+		t.Fatalf("expected process_exit confidence to remain observed, got %q", got)
+	}
+}
+
 func TestMissingEvidenceListsUnsatisfiedRequirements(t *testing.T) {
 	runDir := t.TempDir()
 	events := []byte(`{"type":"assertion_recorded","data":{"id":"as-1","subject":"patch","predicate":"applies_cleanly","confidence":"observed","evidence_id":"ev-1","evidence_source":"process_exit","action_id":"act-1"}}
