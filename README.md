@@ -5,7 +5,8 @@ A local, terminal-first, evidence-auditable resource planner.
 ## v0.1 CLI
 
 This repository contains a Go implementation of the v0.1 vertical slice
-described in `spec-v01.md`.
+described in `spec-v01.md`. Core types live in `internal/model/`; GitRepo
+validation is in `internal/gitrepo/`.
 
 ```sh
 go run ./cmd/rp version
