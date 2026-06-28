@@ -2,6 +2,7 @@ package main
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 )
@@ -75,6 +76,85 @@ func TestGoalSatisfiedHonorsAllowedEvidenceSources(t *testing.T) {
 	goal.RequiresEvidence[0].AnySourceType = []string{"llm_claim"}
 	if !goalSatisfied(runDir, goal) {
 		t.Fatal("matching source should satisfy requirement")
+	}
+}
+
+func TestMissingEvidenceListsUnsatisfiedRequirements(t *testing.T) {
+	runDir := t.TempDir()
+	events := []byte(`{"type":"assertion_recorded","data":{"id":"as-1","subject":"patch","predicate":"applies_cleanly","confidence":"observed","evidence_id":"ev-1","evidence_source":"process_exit","action_id":"act-1"}}
+`)
+	if err := os.WriteFile(filepath.Join(runDir, "events.jsonl"), events, 0644); err != nil {
+		t.Fatal(err)
+	}
+	goal := Goal{RequiresEvidence: []Requirement{
+		{Subject: "patch", Predicate: "applies_cleanly", MinConfidence: "observed"},
+		{Subject: "patched_repo", Predicate: "tests_pass", MinConfidence: "observed"},
+	}}
+	missing := missingEvidence(runDir, goal)
+	if len(missing) != 1 {
+		t.Fatalf("expected one missing requirement, got %+v", missing)
+	}
+	if missing[0].Subject != "patched_repo" || missing[0].Predicate != "tests_pass" {
+		t.Fatalf("unexpected missing requirement: %+v", missing[0])
+	}
+}
+
+func TestObserveGitStatusDoesNotClaimDirtyWorktreeClean(t *testing.T) {
+	dir := t.TempDir()
+	oldwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := os.Chdir(oldwd); err != nil {
+			t.Fatal(err)
+		}
+	}()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	if err := exec.Command("git", "init").Run(); err != nil {
+		t.Skipf("git init failed: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(".rp", "runs"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	planner := []byte(`version: rp.dev/v0.1
+resources:
+  repo:
+    type: GitRepo
+    realizations:
+      - id: repo.local
+        kind: local_path
+        uri: file://.
+        media_type: inode/directory
+policies:
+  local_safe:
+    permissions: {}
+defaults:
+  policy: local_safe
+`)
+	if err := os.WriteFile(filepath.Join(".rp", "planner.yaml"), planner, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile("untracked.txt", []byte("dirty\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := cmdObserve([]string{"repo", "--with", "git_status"}); err != nil {
+		t.Fatal(err)
+	}
+	runDir, err := latestRunDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertions, err := assertionsFromRun(runDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, as := range assertions {
+		if as.Subject == "repo" && as.Predicate == "clean_worktree" {
+			t.Fatalf("dirty worktree should not be recorded as clean: %+v", as)
+		}
 	}
 }
 

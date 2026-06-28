@@ -558,7 +558,7 @@ func cmdAchieve(args []string) error {
 		capability := cfg.Capabilities[step.Capability]
 		if err := checkCapabilityPolicy(cfg, capability); err != nil {
 			appendEvent(ctx, "run_stopped", step.ID, map[string]interface{}{"reason": err.Error()})
-			writeSummary(ctx, goalName, false, err.Error())
+			writeSummary(ctx, goalName, false, err.Error(), missingEvidence(ctx.RunDir, cfg.Goals[goalName]))
 			return err
 		}
 		if needsWriteApproval(cfg, capability) && !*yes {
@@ -571,17 +571,27 @@ func cmdAchieve(args []string) error {
 		}
 		if err := executeStep(ctx, cfg, step, resources); err != nil {
 			appendEvent(ctx, "run_stopped", "", map[string]interface{}{"reason": err.Error()})
-			writeSummary(ctx, goalName, false, err.Error())
+			writeSummary(ctx, goalName, false, err.Error(), missingEvidence(ctx.RunDir, cfg.Goals[goalName]))
 			return err
 		}
+		missing := missingEvidence(ctx.RunDir, cfg.Goals[goalName])
+		appendEvent(ctx, "goal_gap_evaluated", step.ID, map[string]interface{}{
+			"missing_count": len(missing),
+			"missing":       missing,
+		})
+		if len(missing) == 0 {
+			appendEvent(ctx, "run_stopped", step.ID, map[string]interface{}{"reason": "goal evidence requirements satisfied"})
+			break
+		}
 	}
-	satisfied := goalSatisfied(ctx.RunDir, cfg.Goals[goalName])
+	missing := missingEvidence(ctx.RunDir, cfg.Goals[goalName])
+	satisfied := len(missing) == 0
 	appendEvent(ctx, "goal_satisfied", "", map[string]interface{}{"satisfied": satisfied})
 	reason := "goal evidence requirements satisfied"
 	if !satisfied {
 		reason = "goal evidence requirements not fully satisfied"
 	}
-	if err := writeSummary(ctx, goalName, satisfied, reason); err != nil {
+	if err := writeSummary(ctx, goalName, satisfied, reason, missing); err != nil {
 		return err
 	}
 	fmt.Printf("run %s %s\n", ctx.RunID, reason)
@@ -692,6 +702,8 @@ func cmdObserve(args []string) error {
 	cmd.Dir = path
 	cmd.Env = environmentFor(cfg)
 	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
 	err = cmd.Run()
 	exitCode := 0
 	if err != nil {
@@ -1137,8 +1149,11 @@ func appendEvent(ctx RunContext, typ, actionID string, data map[string]interface
 	_, _ = ctx.Events.Write(append(b, '\n'))
 }
 
-func writeSummary(ctx RunContext, goal string, satisfied bool, reason string) error {
+func writeSummary(ctx RunContext, goal string, satisfied bool, reason string, missing ...[]Requirement) error {
 	summary := map[string]interface{}{"run_id": ctx.RunID, "goal": goal, "satisfied": satisfied, "reason": reason, "config_hash": ctx.ConfigHash, "policy_hash": ctx.PolicyHash}
+	if len(missing) > 0 && len(missing[0]) > 0 {
+		summary["missing_evidence"] = missing[0]
+	}
 	b, _ := json.MarshalIndent(summary, "", "  ")
 	return os.WriteFile(filepath.Join(ctx.RunDir, "summary.json"), append(b, '\n'), 0644)
 }
@@ -1161,10 +1176,15 @@ func goalFromRun(runID string) (string, error) {
 }
 
 func goalSatisfied(runDir string, goal Goal) bool {
+	return len(missingEvidence(runDir, goal)) == 0
+}
+
+func missingEvidence(runDir string, goal Goal) []Requirement {
 	assertions, err := assertionsFromRun(runDir)
 	if err != nil {
-		return false
+		return goal.RequiresEvidence
 	}
+	var missing []Requirement
 	for _, req := range goal.RequiresEvidence {
 		ok := false
 		for _, as := range assertions {
@@ -1173,10 +1193,10 @@ func goalSatisfied(runDir string, goal Goal) bool {
 			}
 		}
 		if !ok {
-			return false
+			missing = append(missing, req)
 		}
 	}
-	return true
+	return missing
 }
 
 func assertionsFromRun(runDir string) ([]AssertionRecord, error) {
