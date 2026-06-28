@@ -701,9 +701,9 @@ func runPlan(root string, cfg Config, configHash, goalName string, plan []PlanSt
 			writeSummary(ctx, goalName, false, err.Error()+"; try: rp replan "+ctx.RunID, missingEvidenceWithConfig(ctx.RunDir, goal, cfg))
 			return err
 		}
-		if capabilityNeedsApproval(cfg, capability) && !yes {
-			appendEvent(ctx, "approval_requested", step.ID, map[string]interface{}{"permission": "filesystem.write"})
-			if !ask("approve filesystem write for "+step.Capability+"?") {
+		if perm := capabilityApprovalPermission(cfg, capability); perm != "" && !yes {
+			appendEvent(ctx, "approval_requested", step.ID, map[string]interface{}{"permission": perm})
+			if !ask("approve "+perm+" for "+step.Capability+"?") {
 				appendEvent(ctx, "approval_denied", step.ID, nil)
 				return errors.New("approval denied")
 			}
@@ -744,7 +744,7 @@ func runPlan(root string, cfg Config, configHash, goalName string, plan []PlanSt
 	if !satisfied {
 		reason = "goal evidence requirements not fully satisfied"
 	} else {
-		recordGoalAttestation(ctx, goal)
+		recordGoalAttestation(ctx, cfg, goal)
 	}
 	if err := writeSummary(ctx, goalName, satisfied, reason, missing); err != nil {
 		return err
@@ -1891,6 +1891,13 @@ func buildPlan(cfg Config, goalName string) ([]PlanStep, error) {
 	if len(steps) == 0 {
 		return nil, errors.New("no plan found under active policy")
 	}
+	steps = filterPlanByConstraints(cfg, goal, steps)
+	if len(steps) == 0 {
+		return nil, errors.New("no plan found under goal constraints")
+	}
+	if err := validatePlanMaxCost(cfg, goal, steps); err != nil {
+		return nil, err
+	}
 	sort.Slice(steps, func(i, j int) bool {
 		pi, pj := planStepPriority(cfg, steps[i]), planStepPriority(cfg, steps[j])
 		if pi != pj {
@@ -2146,7 +2153,7 @@ func executedCapabilitiesFromEvents(runDir string) map[string]bool {
 	return executed
 }
 
-func recordGoalAttestation(ctx RunContext, goal Goal) {
+func recordGoalAttestation(ctx RunContext, cfg Config, goal Goal) {
 	assertions, err := assertionsFromRun(ctx.RunDir)
 	if err != nil {
 		return
@@ -2177,6 +2184,7 @@ func recordGoalAttestation(ctx RunContext, goal Goal) {
 		"id":            "att-goal-" + ctx.RunID,
 		"assertion_ids": assertionIDs,
 		"evidence_ids":  evidenceIDs,
+		"input_hashes":  inputHashesForGoal(ctx.Root, cfg, goal),
 		"config_hash":   ctx.ConfigHash,
 		"policy_hash":   ctx.PolicyHash,
 		"run_id":        ctx.RunID,
@@ -2534,6 +2542,191 @@ func filterPlanByPolicy(cfg Config, steps []PlanStep) []PlanStep {
 	return out
 }
 
+func filterPlanByConstraints(cfg Config, goal Goal, steps []PlanStep) []PlanStep {
+	limits := effectiveMaxCost(cfg, goal)
+	var out []PlanStep
+	for _, step := range steps {
+		capability := cfg.Capabilities[step.Capability]
+		if err := checkGoalConstraints(goal, capability); err != nil {
+			continue
+		}
+		if capabilityExceedsMaxCost(capability, limits) {
+			continue
+		}
+		out = append(out, step)
+	}
+	return out
+}
+
+func effectiveMaxCost(cfg Config, goal Goal) map[string]interface{} {
+	out := map[string]interface{}{}
+	for k, v := range activePolicy(cfg).MaxCost {
+		out[k] = v
+	}
+	if raw, ok := goal.Constraints["max_cost"].(map[string]interface{}); ok {
+		for k, v := range raw {
+			if existing, ok := out[k]; ok {
+				out[k] = minCostLimit(existing, v)
+			} else {
+				out[k] = v
+			}
+		}
+	}
+	return out
+}
+
+func minCostLimit(a, b interface{}) interface{} {
+	if aStr, ok := a.(string); ok {
+		if bStr, ok := b.(string); ok {
+			if strings.HasSuffix(aStr, "m") && strings.HasSuffix(bStr, "m") {
+				return minCostString(aStr, bStr)
+			}
+			if humanAttentionRank(aStr) > 0 && humanAttentionRank(bStr) > 0 {
+				if humanAttentionRank(bStr) < humanAttentionRank(aStr) {
+					return bStr
+				}
+				return aStr
+			}
+		}
+	}
+	if aNum, ok := numericCost(a); ok {
+		if bNum, ok := numericCost(b); ok && bNum < aNum {
+			return b
+		}
+	}
+	return a
+}
+
+func numericCost(v interface{}) (float64, bool) {
+	switch x := v.(type) {
+	case int:
+		return float64(x), true
+	case int64:
+		return float64(x), true
+	case float64:
+		return x, true
+	default:
+		return 0, false
+	}
+}
+
+func parseDurationBudget(s string) (time.Duration, bool) {
+	if s == "" {
+		return 0, false
+	}
+	if strings.HasSuffix(s, "m") {
+		n, err := strconv.Atoi(strings.TrimSuffix(s, "m"))
+		if err != nil {
+			return 0, false
+		}
+		return time.Duration(n) * time.Minute, true
+	}
+	d, err := time.ParseDuration(s)
+	if err != nil {
+		return 0, false
+	}
+	return d, true
+}
+
+func capabilityEstimatedMinutes(cap Capability) int {
+	switch costString(cap.Cost["time"]) {
+	case "cheap":
+		return 1
+	case "expensive":
+		return 8
+	default:
+		return 2
+	}
+}
+
+func costString(v interface{}) string {
+	s, _ := v.(string)
+	return s
+}
+
+func humanAttentionRank(v interface{}) int {
+	switch costString(v) {
+	case "none":
+		return 0
+	case "approval_if_required":
+		return 1
+	case "low":
+		return 2
+	case "medium":
+		return 3
+	case "high":
+		return 4
+	default:
+		return -1
+	}
+}
+
+func capabilityExceedsMaxCost(cap Capability, limits map[string]interface{}) bool {
+	if len(limits) == 0 {
+		return false
+	}
+	if budget, ok := limits["time"].(string); ok {
+		if dur, ok := parseDurationBudget(budget); ok {
+			if time.Duration(capabilityEstimatedMinutes(cap))*time.Minute > dur {
+				return true
+			}
+		}
+	}
+	if budget, ok := numericCost(limits["money_usd"]); ok {
+		if capCost, ok := numericCost(cap.Cost["money_usd"]); ok && capCost > budget {
+			return true
+		}
+	}
+	if budget, ok := numericCost(limits["tokens"]); ok {
+		if capCost, ok := numericCost(cap.Cost["tokens"]); ok && capCost > budget {
+			return true
+		}
+	}
+	if budget, ok := limits["human_attention"].(string); ok {
+		if humanAttentionRank(cap.Cost["human_attention"]) > humanAttentionRank(budget) {
+			return true
+		}
+	}
+	return false
+}
+
+func validatePlanMaxCost(cfg Config, goal Goal, plan []PlanStep) error {
+	limits := effectiveMaxCost(cfg, goal)
+	if len(limits) == 0 {
+		return nil
+	}
+	totalMinutes := 0
+	totalMoney := 0.0
+	totalTokens := 0.0
+	for _, step := range plan {
+		cap := cfg.Capabilities[step.Capability]
+		if capabilityExceedsMaxCost(cap, limits) {
+			return fmt.Errorf("capability %s exceeds max_cost budget", step.Capability)
+		}
+		totalMinutes += capabilityEstimatedMinutes(cap)
+		if v, ok := numericCost(cap.Cost["money_usd"]); ok {
+			totalMoney += v
+		}
+		if v, ok := numericCost(cap.Cost["tokens"]); ok {
+			totalTokens += v
+		}
+	}
+	if budget, ok := limits["time"].(string); ok {
+		if dur, ok := parseDurationBudget(budget); ok {
+			if time.Duration(totalMinutes)*time.Minute > dur {
+				return fmt.Errorf("plan estimated time %dm exceeds max_cost budget %s", totalMinutes, budget)
+			}
+		}
+	}
+	if budget, ok := numericCost(limits["money_usd"]); ok && totalMoney > budget {
+		return fmt.Errorf("plan estimated cost $%.2f exceeds max_cost budget", totalMoney)
+	}
+	if budget, ok := numericCost(limits["tokens"]); ok && totalTokens > budget {
+		return fmt.Errorf("plan estimated tokens %.0f exceeds max_cost budget", totalTokens)
+	}
+	return nil
+}
+
 func checkGoalConstraints(goal Goal, cap Capability) error {
 	perms, ok := goal.Constraints["permissions"].(map[string]interface{})
 	if !ok {
@@ -2583,20 +2776,37 @@ func declaresCredentialUse(cap Capability) bool {
 	return strings.Contains(strings.ToLower(cap.Effects.External), "credential")
 }
 
+func capabilityApprovalPermission(cfg Config, cap Capability) string {
+	if capabilityNeedsDestructiveApproval(cfg, cap) {
+		return "filesystem.destructive_write"
+	}
+	if capabilityNeedsWriteApproval(cfg, cap) {
+		return "filesystem.write"
+	}
+	return ""
+}
+
 func capabilityNeedsApproval(cfg Config, cap Capability) bool {
+	return capabilityApprovalPermission(cfg, cap) != ""
+}
+
+func capabilityNeedsDestructiveApproval(cfg Config, cap Capability) bool {
+	if cap.Idempotence != "non_idempotent" || len(cap.Effects.Filesystem["writes"]) == 0 {
+		return false
+	}
+	return permissionValue(activePolicy(cfg).Permissions, "filesystem", "destructive_write") == "approval_required"
+}
+
+func capabilityNeedsWriteApproval(cfg Config, cap Capability) bool {
 	if capabilityDeclaresWriteApproval(cap) {
-		policyName := cfg.Defaults["policy"]
-		pol := cfg.Policies[policyName]
-		if permissionValue(pol.Permissions, "filesystem", "write") == "approval_required" {
+		if permissionValue(activePolicy(cfg).Permissions, "filesystem", "write") == "approval_required" {
 			return true
 		}
 	}
 	if len(cap.Effects.Filesystem["writes"]) == 0 {
 		return false
 	}
-	policyName := cfg.Defaults["policy"]
-	pol := cfg.Policies[policyName]
-	return permissionValue(pol.Permissions, "filesystem", "write") == "approval_required"
+	return permissionValue(activePolicy(cfg).Permissions, "filesystem", "write") == "approval_required"
 }
 
 func capabilityDeclaresWriteApproval(cap Capability) bool {
@@ -3042,6 +3252,30 @@ func realizationURI(res Resource) string {
 		return ""
 	}
 	return res.Realizations[0].URI
+}
+
+func inputHashesForGoal(root string, cfg Config, goal Goal) map[string]string {
+	hashes := map[string]string{}
+	for inputName, resName := range goal.Given {
+		res, ok := cfg.Resources[resName]
+		if !ok {
+			continue
+		}
+		if len(res.Realizations) > 0 && res.Realizations[0].Hash != "" {
+			hashes[inputName] = res.Realizations[0].Hash
+			continue
+		}
+		path := pathFromURI(root, realizationURI(res))
+		info, err := os.Stat(path)
+		if err != nil || info.IsDir() {
+			continue
+		}
+		b, err := os.ReadFile(path)
+		if err == nil {
+			hashes[inputName] = sha(b)
+		}
+	}
+	return hashes
 }
 
 func pathFromURI(root, uri string) string {

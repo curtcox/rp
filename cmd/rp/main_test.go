@@ -1263,7 +1263,11 @@ func TestRecordGoalAttestation(t *testing.T) {
 		t.Fatal(err)
 	}
 	ctx.Events = f
-	recordGoalAttestation(ctx, goal)
+	recordGoalAttestation(ctx, Config{
+		Resources: map[string]Resource{
+			"bug_report": {Realizations: []Realization{{URI: "file://bug.md"}}},
+		},
+	}, goal)
 	all, err := readEvents(ctx.RunDir)
 	if err != nil {
 		t.Fatal(err)
@@ -1276,5 +1280,80 @@ func TestRecordGoalAttestation(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("expected goal attestation event")
+	}
+}
+
+func TestCapabilityDestructiveWriteApproval(t *testing.T) {
+	cfg := Config{
+		Defaults: map[string]string{"policy": "local_safe"},
+		Policies: map[string]Policy{"local_safe": {
+			Permissions: map[string]interface{}{
+				"filesystem": map[string]interface{}{
+					"write":             "allowed",
+					"destructive_write": "approval_required",
+				},
+			},
+		}},
+	}
+	capability := Capability{
+		Idempotence: "non_idempotent",
+		Effects:     EffectSpec{Filesystem: map[string][]string{"writes": []string{"."}}},
+	}
+	if got := capabilityApprovalPermission(cfg, capability); got != "filesystem.destructive_write" {
+		t.Fatalf("expected destructive_write approval, got %q", got)
+	}
+}
+
+func TestValidatePlanMaxCostRejectsExpensivePlan(t *testing.T) {
+	cfg := Config{
+		Defaults: map[string]string{"policy": "local_safe"},
+		Policies: map[string]Policy{"local_safe": {
+			MaxCost: map[string]interface{}{"time": "1m"},
+		}},
+		Capabilities: map[string]Capability{
+			"cheap":      {Cost: map[string]interface{}{"time": "cheap"}},
+			"expensive":  {Cost: map[string]interface{}{"time": "expensive"}},
+		},
+	}
+	goal := Goal{Constraints: map[string]interface{}{
+		"max_cost": map[string]interface{}{"time": "1m"},
+	}}
+	plan := []PlanStep{{Capability: "cheap"}, {Capability: "expensive"}}
+	if err := validatePlanMaxCost(cfg, goal, plan); err == nil {
+		t.Fatal("expected plan to exceed 1m budget")
+	}
+}
+
+func TestFilterPlanByConstraintsRemovesForbiddenNetwork(t *testing.T) {
+	goal := Goal{Constraints: map[string]interface{}{
+		"permissions": map[string]interface{}{"network": "forbidden"},
+	}}
+	cfg := Config{
+		Capabilities: map[string]Capability{
+			"ok":      {Effects: EffectSpec{External: "local_process"}},
+			"network": {Effects: EffectSpec{Network: map[string]interface{}{"access": true}}},
+		},
+	}
+	steps := filterPlanByConstraints(cfg, goal, []PlanStep{{Capability: "ok"}, {Capability: "network"}})
+	if len(steps) != 1 || steps[0].Capability != "ok" {
+		t.Fatalf("expected only ok step, got %+v", steps)
+	}
+}
+
+func TestInputHashesForGoalHashesFileResources(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "bug.md")
+	if err := os.WriteFile(path, []byte("bug"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := Config{
+		Resources: map[string]Resource{
+			"bug_report": {Realizations: []Realization{{URI: "file://" + path}}},
+		},
+	}
+	goal := Goal{Given: map[string]string{"bug_report": "bug_report"}}
+	hashes := inputHashesForGoal(dir, cfg, goal)
+	if len(hashes) != 1 || hashes["bug_report"] == "" {
+		t.Fatalf("expected bug_report hash, got %+v", hashes)
 	}
 }
