@@ -57,6 +57,11 @@ test:
 test-race:
 	go test -race ./...
 
+## doctest: run the runnable examples embedded in docs/ (see docs/README.md)
+.PHONY: doctest
+doctest:
+	go test ./cmd/rp -run TestDocExamples -v
+
 ## fmt: format all Go code in place
 .PHONY: fmt
 fmt:
@@ -98,6 +103,9 @@ complexity:
 	@$(GOCOGNIT) -over $(GOCOGNIT_OVER) -avg . || true
 
 ## check: the gating suite run by CI (tests + gofmt + vet + lint)
+# `test` runs `go test ./...`, which includes the docs doctest harness
+# (TestDocExamples); a drifted runnable example fails the gate. `make doctest`
+# runs just that harness, verbosely, for a focused loop.
 .PHONY: check
 check: fmt-check vet lint test
 	@echo "All gating checks passed."
