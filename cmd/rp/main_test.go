@@ -493,11 +493,11 @@ func TestGoalSatisfiedHonorsAllowedEvidenceSources(t *testing.T) {
 		MinConfidence: "observed",
 		AnySourceType: []string{"process_exit"},
 	}}}
-	if goalSatisfied(runDir, goal) {
+	if goalSatisfied(runDir, goal, Config{}) {
 		t.Fatal("llm_claim should not satisfy process_exit-only requirement")
 	}
 	goal.RequiresEvidence[0].AnySourceType = []string{"llm_claim"}
-	if !goalSatisfied(runDir, goal) {
+	if !goalSatisfied(runDir, goal, Config{}) {
 		t.Fatal("matching source should satisfy requirement")
 	}
 }
@@ -1436,5 +1436,148 @@ func TestFailureStopDataHonorsOnFailurePolicy(t *testing.T) {
 	}
 	if !strings.Contains(summary, "rp replan run-123") {
 		t.Fatalf("expected replan hint in summary, got %q", summary)
+	}
+}
+
+func TestMissingProduceRequiresRealization(t *testing.T) {
+	runDir := t.TempDir()
+	events := []byte(`{"type":"resource_realization_recorded","data":{"resource":"patch","artifact":"artifacts/proposed.patch","media_type":"text/plain","kind":"file"}}
+`)
+	if err := os.WriteFile(filepath.Join(runDir, "events.jsonl"), events, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(runDir, "artifacts"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(runDir, "artifacts/proposed.patch"), []byte("diff"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	goal := Goal{Produce: map[string]OutputSpec{
+		"patch": {Type: "Patch", RequiredRealization: Realization{Kind: "file", MediaType: "text/x-diff"}},
+	}}
+	gaps := missingProduce(runDir, goal)
+	if len(gaps) != 1 || !strings.Contains(gaps[0], "media_type") {
+		t.Fatalf("expected media_type mismatch, got %+v", gaps)
+	}
+	events = []byte(`{"type":"resource_realization_recorded","data":{"resource":"patch","artifact":"artifacts/proposed.patch","media_type":"text/x-diff","kind":"file"}}
+`)
+	if err := os.WriteFile(filepath.Join(runDir, "events.jsonl"), events, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if len(missingProduce(runDir, goal)) != 0 {
+		t.Fatal("matching realization should satisfy produce requirement")
+	}
+}
+
+func TestDryRunPrintsEffectSummary(t *testing.T) {
+	dir := t.TempDir()
+	planner := []byte(`version: rp.dev/v0.1
+capabilities:
+  ok:
+    purpose: observe
+    kind: command
+    outputs:
+      result:
+        type: CommandResult
+    command:
+      cwd: "."
+      argv: [echo, ok]
+    effects:
+      external: local_process
+      filesystem:
+        writes: []
+goals:
+  smoke:
+    requires_evidence: []
+policies:
+  local_safe:
+    permissions: {}
+defaults:
+  policy: local_safe
+`)
+	if err := os.MkdirAll(filepath.Join(dir, ".rp"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".rp", "planner.yaml"), planner, 0644); err != nil {
+		t.Fatal(err)
+	}
+	oldwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := os.Chdir(oldwd); err != nil {
+			t.Fatal(err)
+		}
+	}()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	oldStdout := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stdout = w
+	err = cmdAchieve([]string{"smoke", "--dry-run"})
+	w.Close()
+	os.Stdout = oldStdout
+	if err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	_, _ = buf.ReadFrom(r)
+	out := buf.String()
+	if !strings.Contains(out, "dry-run") || !strings.Contains(out, "Effect summary:") {
+		t.Fatalf("expected dry-run effect summary, got %q", out)
+	}
+}
+
+func TestAuditPrintsSummaryHeader(t *testing.T) {
+	dir := t.TempDir()
+	runDir := filepath.Join(dir, ".rp", "runs", "run-audit")
+	if err := os.MkdirAll(runDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	events := []byte(`{"type":"run_started","time":"2026-01-01T00:00:00Z","data":{"goal":"bugfix_patch"}}
+{"type":"attestation_recorded","time":"2026-01-01T00:00:01Z","data":{"id":"att-goal-run-audit"}}
+`)
+	if err := os.WriteFile(filepath.Join(runDir, "events.jsonl"), events, 0644); err != nil {
+		t.Fatal(err)
+	}
+	summary := []byte(`{"goal":"bugfix_patch","satisfied":true,"reason":"ok","config_hash":"abc","policy_hash":"def"}
+`)
+	if err := os.WriteFile(filepath.Join(runDir, "summary.json"), summary, 0644); err != nil {
+		t.Fatal(err)
+	}
+	oldwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := os.Chdir(oldwd); err != nil {
+			t.Fatal(err)
+		}
+	}()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	oldStdout := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stdout = w
+	err = cmdAudit([]string{"run-audit"})
+	w.Close()
+	os.Stdout = oldStdout
+	if err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	_, _ = buf.ReadFrom(r)
+	out := buf.String()
+	if !strings.Contains(out, "Audit run-audit") || !strings.Contains(out, "Attestation: att-goal-run-audit") || !strings.Contains(out, "run_started: 1") {
+		t.Fatalf("unexpected audit output: %q", out)
 	}
 }

@@ -47,7 +47,8 @@ checks, and `execution.plan_changes` / `execution.on_failure` during JIT replan,
 effect summary with plans and runs, writes artifacts under
 `.rp/runs/<run-id>/artifacts`, records append-only JSONL events (including
 `action_failed` for non-zero exits when `always_record_result` is set), and
-explains assertions from the latest run. Use `rp replay RUN_ID` for a narrative
+explains assertions from the latest run. `rp evidence` reports both required outputs
+(`goal.produce`) and required evidence. Use `rp replay RUN_ID` for a narrative
 reconstruction of a run; `rp audit RUN_ID` prints the raw event timeline.
 `rp replan RUN_ID --yes` continues execution in the prior run; `rp rerun RUN_ID`
 starts a fresh run for the same goal.

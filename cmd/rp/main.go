@@ -576,9 +576,11 @@ func cmdAchieve(args []string) error {
 
 func runPlan(root string, cfg Config, configHash, goalName string, plan []PlanStep, planID string, dryRun, stepMode, yes, jit bool, autoRepair bool, maxAttempts int, resumeRunID string) error {
 	if dryRun {
+		fmt.Printf("Plan for %s (%d steps) [dry-run — no execution]\n", goalName, len(plan))
 		for i, step := range plan {
-			fmt.Printf("%d. %s (%s)\n", i+1, step.Capability, step.Reason)
+			fmt.Printf("  %d. %s — %s\n", i+1, step.Capability, step.Reason)
 		}
+		printEffectSummary(cfg, plan)
 		return nil
 	}
 	var ctx RunContext
@@ -649,7 +651,7 @@ func runPlan(root string, cfg Config, configHash, goalName string, plan []PlanSt
 			steps, err = buildPlan(cfg, goalName)
 			if err != nil {
 				appendEvent(ctx, "run_stopped", "", map[string]interface{}{"reason": err.Error()})
-				writeSummary(ctx, goalName, false, err.Error(), missingEvidenceWithConfig(ctx.RunDir, goal, cfg))
+				writeSummary(ctx, goalName, false, err.Error(), missingEvidenceWithConfig(ctx.RunDir, goal, cfg), missingProduce(ctx.RunDir, goal))
 				return err
 			}
 			newCaps := planCapabilities(steps)
@@ -692,19 +694,19 @@ func runPlan(root string, cfg Config, configHash, goalName string, plan []PlanSt
 		capability := cfg.Capabilities[step.Capability]
 		if err := checkCapabilityPolicy(cfg, capability); err != nil {
 			appendEvent(ctx, "run_stopped", step.ID, map[string]interface{}{"reason": err.Error()})
-			writeSummary(ctx, goalName, false, err.Error(), missingEvidenceWithConfig(ctx.RunDir, goal, cfg))
+			writeSummary(ctx, goalName, false, err.Error(), missingEvidenceWithConfig(ctx.RunDir, goal, cfg), missingProduce(ctx.RunDir, goal))
 			return err
 		}
 		if err := checkGoalConstraints(goal, capability); err != nil {
 			appendEvent(ctx, "run_stopped", step.ID, map[string]interface{}{"reason": err.Error()})
-			writeSummary(ctx, goalName, false, err.Error(), missingEvidenceWithConfig(ctx.RunDir, goal, cfg))
+			writeSummary(ctx, goalName, false, err.Error(), missingEvidenceWithConfig(ctx.RunDir, goal, cfg), missingProduce(ctx.RunDir, goal))
 			return err
 		}
 		if err := checkStepPreconditions(ctx.RunDir, cfg, *step); err != nil {
 			appendEvent(ctx, "plan_invalidated", step.ID, map[string]interface{}{"reason": err.Error(), "suggest": "replan"})
 			stopData, summaryReason := failureStopData(cfg, ctx.RunID, err.Error())
 			appendEvent(ctx, "run_stopped", "", stopData)
-			writeSummary(ctx, goalName, false, summaryReason, missingEvidenceWithConfig(ctx.RunDir, goal, cfg))
+			writeSummary(ctx, goalName, false, summaryReason, missingEvidenceWithConfig(ctx.RunDir, goal, cfg), missingProduce(ctx.RunDir, goal))
 			return err
 		}
 		if perm := capabilityApprovalPermission(cfg, capability); perm != "" && !yes {
@@ -727,7 +729,7 @@ func runPlan(root string, cfg Config, configHash, goalName string, plan []PlanSt
 			}
 			stopData, summaryReason := failureStopData(cfg, ctx.RunID, err.Error())
 			appendEvent(ctx, "run_stopped", "", stopData)
-			writeSummary(ctx, goalName, false, summaryReason, missingEvidenceWithConfig(ctx.RunDir, goal, cfg))
+			writeSummary(ctx, goalName, false, summaryReason, missingEvidenceWithConfig(ctx.RunDir, goal, cfg), missingProduce(ctx.RunDir, goal))
 			return err
 		}
 		executedCaps[step.Capability] = true
@@ -745,15 +747,23 @@ func runPlan(root string, cfg Config, configHash, goalName string, plan []PlanSt
 		}
 	}
 	missing := missingEvidenceWithConfig(ctx.RunDir, cfg.Goals[goalName], cfg)
-	satisfied := len(missing) == 0
+	produceGaps := missingProduce(ctx.RunDir, goal)
+	satisfied := len(missing) == 0 && len(produceGaps) == 0
 	appendEvent(ctx, "goal_satisfied", "", map[string]interface{}{"satisfied": satisfied})
 	reason := "goal evidence requirements satisfied"
 	if !satisfied {
-		reason = "goal evidence requirements not fully satisfied"
+		switch {
+		case len(missing) > 0 && len(produceGaps) > 0:
+			reason = "goal evidence and produce requirements not fully satisfied"
+		case len(produceGaps) > 0:
+			reason = "goal produce requirements not fully satisfied"
+		default:
+			reason = "goal evidence requirements not fully satisfied"
+		}
 	} else {
 		recordGoalAttestation(ctx, cfg, goal)
 	}
-	if err := writeSummary(ctx, goalName, satisfied, reason, missing); err != nil {
+	if err := writeSummary(ctx, goalName, satisfied, reason, missing, produceGaps); err != nil {
 		return err
 	}
 	fmt.Printf("run %s %s\n", ctx.RunID, reason)
@@ -782,9 +792,41 @@ func cmdEvidence(args []string) error {
 	if g, _ := summary["goal"].(string); g != "" && g != goalName {
 		fmt.Printf("note: latest run goal is %q, not %q\n", g, goalName)
 	}
-	satisfied := goalSatisfied(runDir, goal)
+	satisfied := goalSatisfied(runDir, goal, cfg)
 	fmt.Printf("Goal %s (run %s)\n", goalName, filepath.Base(runDir))
 	fmt.Printf("Satisfied: %v\n\n", satisfied)
+	if len(goal.Produce) > 0 {
+		fmt.Println("Required outputs:")
+		realizations := realizationsFromRun(runDir)
+		for _, name := range sortedKeys(goal.Produce) {
+			spec := goal.Produce[name]
+			status := "missing"
+			detail := ""
+			if rec, ok := realizations[name]; ok {
+				if reason := produceSpecMismatch(runDir, spec, rec); reason == "" {
+					status = "ok"
+					if rec.MediaType != "" {
+						detail = rec.MediaType
+					}
+					if rec.Artifact != "" {
+						if detail != "" {
+							detail += " at "
+						}
+						detail += rec.Artifact
+					}
+				} else {
+					status = "mismatch"
+					detail = reason
+				}
+			}
+			line := fmt.Sprintf("  [%s] %s (%s)", status, name, spec.Type)
+			if detail != "" {
+				line += " — " + detail
+			}
+			fmt.Println(line)
+		}
+		fmt.Println()
+	}
 	fmt.Println("Required evidence:")
 	assertions, _ := assertionsFromRun(runDir)
 	effective := effectiveAssertions(assertions)
@@ -938,7 +980,7 @@ func cmdObserve(args []string) error {
 		recordAssertion(ctx, actionID, rec)
 	}
 	appendEvent(ctx, "action_completed", actionID, map[string]interface{}{"exit_code": exitCode})
-	if err := writeSummary(ctx, "manual_observe", exitCode == 0, "manual git_status observation recorded"); err != nil {
+	if err := writeSummary(ctx, "manual_observe", exitCode == 0, "manual git_status observation recorded", nil, nil); err != nil {
 		return err
 	}
 	fmt.Println(ctx.RunDir)
@@ -971,11 +1013,47 @@ func cmdAudit(args []string) error {
 	if len(args) != 1 {
 		return errors.New("usage: rp audit RUN_ID")
 	}
-	runDir := filepath.Join(".rp", "runs", args[0])
+	runID := args[0]
+	runDir := filepath.Join(".rp", "runs", runID)
 	events, err := readEvents(runDir)
 	if err != nil {
 		return err
 	}
+	summary := loadRunSummary(runDir)
+	fmt.Printf("Audit %s\n", runID)
+	if goal, _ := summary["goal"].(string); goal != "" {
+		fmt.Printf("Goal: %s\n", goal)
+	}
+	if satisfied, ok := summary["satisfied"].(bool); ok {
+		fmt.Printf("Satisfied: %v\n", satisfied)
+	}
+	if reason, _ := summary["reason"].(string); reason != "" {
+		fmt.Printf("Reason: %s\n", reason)
+	}
+	if h, _ := summary["config_hash"].(string); h != "" {
+		fmt.Printf("Config: %s\n", shortHash(h))
+	}
+	if h, _ := summary["policy_hash"].(string); h != "" {
+		fmt.Printf("Policy: %s\n", shortHash(h))
+	}
+	counts := map[string]int{}
+	var attestationID string
+	for _, ev := range events {
+		counts[ev.Type]++
+		if ev.Type == "attestation_recorded" {
+			attestationID, _ = ev.Data["id"].(string)
+		}
+	}
+	if len(counts) > 0 {
+		fmt.Printf("Events: %d\n", len(events))
+		for _, typ := range sortedKeys(counts) {
+			fmt.Printf("  %s: %d\n", typ, counts[typ])
+		}
+	}
+	if attestationID != "" {
+		fmt.Printf("Attestation: %s\n", attestationID)
+	}
+	fmt.Println()
 	for _, ev := range events {
 		fmt.Printf("%s\t%s\t%s\n", ev.Time, ev.Type, ev.ActionID)
 	}
@@ -2009,6 +2087,11 @@ func executeStep(ctx RunContext, cfg Config, step PlanStep, resources map[string
 				"resource": outName, "artifact": capability.Command.Stdout.SaveAs.ArtifactPath,
 				"media_type": capability.Command.Stdout.SaveAs.MediaType,
 			}
+			if kind := out.Realization.Kind; kind != "" {
+				realizationData["kind"] = kind
+			} else if capability.Command.Stdout.SaveAs.Resource != "" {
+				realizationData["kind"] = "file"
+			}
 			if policyHashing(cfg, "file_backed_realizations") {
 				realizationData["sha256"] = sha(stdout.Bytes())
 			}
@@ -2213,10 +2296,13 @@ func appendEvent(ctx RunContext, typ, actionID string, data map[string]interface
 	_, _ = ctx.Events.Write(append(b, '\n'))
 }
 
-func writeSummary(ctx RunContext, goal string, satisfied bool, reason string, missing ...[]Requirement) error {
+func writeSummary(ctx RunContext, goal string, satisfied bool, reason string, missing []Requirement, produceGaps []string) error {
 	summary := map[string]interface{}{"run_id": ctx.RunID, "goal": goal, "satisfied": satisfied, "reason": reason, "config_hash": ctx.ConfigHash, "policy_hash": ctx.PolicyHash}
-	if len(missing) > 0 && len(missing[0]) > 0 {
-		summary["missing_evidence"] = missing[0]
+	if len(missing) > 0 {
+		summary["missing_evidence"] = missing
+	}
+	if len(produceGaps) > 0 {
+		summary["missing_produce"] = produceGaps
 	}
 	b, _ := json.MarshalIndent(summary, "", "  ")
 	return os.WriteFile(filepath.Join(ctx.RunDir, "summary.json"), append(b, '\n'), 0644)
@@ -2284,8 +2370,79 @@ func loadSavedPlan(root, planID string) (SavedPlan, error) {
 	return plan, nil
 }
 
-func goalSatisfied(runDir string, goal Goal) bool {
-	return len(missingEvidence(runDir, goal)) == 0
+func goalSatisfied(runDir string, goal Goal, cfg Config) bool {
+	return len(missingEvidenceWithConfig(runDir, goal, cfg)) == 0 && len(missingProduce(runDir, goal)) == 0
+}
+
+type ProduceRecord struct {
+	Resource  string
+	Artifact  string
+	MediaType string
+	Kind      string
+}
+
+func realizationsFromRun(runDir string) map[string]ProduceRecord {
+	events, err := readEvents(runDir)
+	if err != nil {
+		return nil
+	}
+	out := map[string]ProduceRecord{}
+	for _, ev := range events {
+		if ev.Type != "resource_realization_recorded" {
+			continue
+		}
+		res, _ := ev.Data["resource"].(string)
+		if res == "" {
+			continue
+		}
+		rec := ProduceRecord{Resource: res}
+		rec.Artifact, _ = ev.Data["artifact"].(string)
+		rec.MediaType, _ = ev.Data["media_type"].(string)
+		rec.Kind, _ = ev.Data["kind"].(string)
+		out[res] = rec
+	}
+	return out
+}
+
+func missingProduce(runDir string, goal Goal) []string {
+	if len(goal.Produce) == 0 {
+		return nil
+	}
+	realizations := realizationsFromRun(runDir)
+	var gaps []string
+	for _, name := range sortedKeys(goal.Produce) {
+		spec := goal.Produce[name]
+		rec, ok := realizations[name]
+		if !ok {
+			gaps = append(gaps, name+": not produced")
+			continue
+		}
+		if reason := produceSpecMismatch(runDir, spec, rec); reason != "" {
+			gaps = append(gaps, name+": "+reason)
+		}
+	}
+	return gaps
+}
+
+func produceSpecMismatch(runDir string, spec OutputSpec, rec ProduceRecord) string {
+	req := spec.RequiredRealization
+	if req.MediaType == "" && req.Kind == "" {
+		return ""
+	}
+	if req.MediaType != "" && rec.MediaType != "" && req.MediaType != rec.MediaType {
+		return fmt.Sprintf("media_type want %s got %s", req.MediaType, rec.MediaType)
+	}
+	if req.Kind == "file" {
+		if rec.Artifact == "" {
+			return "missing file artifact"
+		}
+		path := filepath.Join(runDir, rec.Artifact)
+		info, err := os.Stat(path)
+		if err != nil || info.IsDir() {
+			return "artifact file not found"
+		}
+	}
+	return ""
 }
 
 func missingEvidence(runDir string, goal Goal) []Requirement {
@@ -2452,7 +2609,7 @@ func appendManualAssertion(subject, predicate, object, confidence, source, note,
 		"config_hash": ctx.ConfigHash, "policy_hash": ctx.PolicyHash, "run_id": ctx.RunID,
 	})
 	appendEvent(ctx, "action_completed", actionID, map[string]interface{}{"manual": true})
-	if err := writeSummary(ctx, "manual_assertion", true, "manual assertion recorded"); err != nil {
+	if err := writeSummary(ctx, "manual_assertion", true, "manual assertion recorded", nil, nil); err != nil {
 		return err
 	}
 	fmt.Println(ctx.RunDir)
