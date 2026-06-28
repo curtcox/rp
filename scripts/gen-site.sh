@@ -132,9 +132,14 @@ cat >"$SITE_DIR/index.html" <<HTML
   footer code { color: #8b949e; }
 </style></head><body>
 <div class="wrap">
-  <h1>rp — test &amp; analysis reports</h1>
+  <h1>rp — documentation &amp; reports</h1>
   <p class="sub">A local, terminal-first, evidence-auditable resource planner.</p>
   <div class="grid">
+    <a class="card" href="docs/index.html">
+      <h2>Documentation</h2>
+      <p>Guides, CLI reference, concepts, config, and tutorials.</p>
+      <span class="badge num">docs</span>
+    </a>
     <a class="card" href="tests.html">
       <h2>Tests</h2>
       <p>Full <code>go test ./...</code> output.</p>
@@ -165,6 +170,15 @@ cat >"$SITE_DIR/index.html" <<HTML
 </div>
 </body></html>
 HTML
+
+# Render the prose documentation (docs/*.md) into $SITE_DIR/docs.
+DOCS_DIR="${DOCS_DIR:-docs}"
+RENDER_DOCS="${RENDER_DOCS:-scripts/render-docs.py}"
+if [ -d "$DOCS_DIR" ]; then
+	echo ">> docs"
+	GENERATED_AT="$GENERATED_AT" COMMIT="$COMMIT" \
+		python3 "$RENDER_DOCS" "$DOCS_DIR" "$SITE_DIR/docs"
+fi
 
 # Clean up intermediate text files.
 rm -f "$SITE_DIR"/_*.txt
