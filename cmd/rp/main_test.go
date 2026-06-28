@@ -211,6 +211,152 @@ func TestRenderPlan(t *testing.T) {
 	}
 }
 
+func TestSummarizePlanEffects(t *testing.T) {
+	cfg := Config{
+		Defaults: map[string]string{"policy": "local_safe"},
+		Policies: map[string]Policy{"local_safe": {Permissions: map[string]interface{}{
+			"filesystem": map[string]interface{}{"write": "approval_required"},
+		}}},
+		Capabilities: map[string]Capability{
+			"observe_git_status": {Effects: EffectSpec{External: "local_process", Filesystem: map[string][]string{"writes": {}}}},
+			"apply_patch_to_worktree": {
+				Effects: EffectSpec{
+					External:   "local_filesystem_write",
+					Filesystem: map[string][]string{"writes": {"${inputs.repo.path}"}},
+				},
+			},
+		},
+	}
+	plan := []PlanStep{
+		{Capability: "observe_git_status"},
+		{Capability: "apply_patch_to_worktree"},
+	}
+	summary := summarizePlanEffects(cfg, plan)
+	if len(summary.External) != 2 {
+		t.Fatalf("expected two external effects, got %+v", summary.External)
+	}
+	if len(summary.FilesystemWrites) != 1 {
+		t.Fatalf("expected one filesystem write, got %+v", summary.FilesystemWrites)
+	}
+	if len(summary.NeedsApproval) != 1 || summary.NeedsApproval[0] != "apply_patch_to_worktree" {
+		t.Fatalf("unexpected approval list: %+v", summary.NeedsApproval)
+	}
+}
+
+func TestPolicyHashingHonorsPolicy(t *testing.T) {
+	cfg := Config{
+		Defaults: map[string]string{"policy": "local_safe"},
+		Policies: map[string]Policy{"local_safe": {Hashing: map[string]interface{}{
+			"command_stdout": true, "file_backed_realizations": false,
+		}}},
+	}
+	if !policyHashing(cfg, "command_stdout") {
+		t.Fatal("command_stdout should be enabled")
+	}
+	if policyHashing(cfg, "file_backed_realizations") {
+		t.Fatal("file_backed_realizations should be disabled")
+	}
+	if policyHashing(cfg, "command_stderr") {
+		t.Fatal("command_stderr should default to disabled")
+	}
+}
+
+func TestPlanAssumptionsListsPreconditions(t *testing.T) {
+	cfg := Config{
+		Capabilities: map[string]Capability{
+			"propose_patch_with_script": {
+				Inputs: map[string]InputSpec{
+					"repo": {Requires: []Requirement{{Predicate: "clean_worktree", MinConfidence: "observed"}}},
+				},
+			},
+			"apply_patch_to_worktree": {
+				Inputs: map[string]InputSpec{
+					"patch": {Requires: []Requirement{{Predicate: "applies_cleanly", MinConfidence: "observed"}}},
+				},
+			},
+		},
+	}
+	plan := []PlanStep{
+		{Capability: "propose_patch_with_script", Inputs: map[string]string{"repo": "repo"}},
+		{Capability: "apply_patch_to_worktree", Inputs: map[string]string{"repo": "repo", "patch": "patch"}},
+	}
+	assumptions := planAssumptions(cfg, plan)
+	if len(assumptions) != 2 {
+		t.Fatalf("expected two assumptions, got %+v", assumptions)
+	}
+}
+
+func TestSpeculativePlanDoesNotSave(t *testing.T) {
+	dir := t.TempDir()
+	oldwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := os.Chdir(oldwd); err != nil {
+			t.Fatal(err)
+		}
+	}()
+	if err := os.MkdirAll(filepath.Join(dir, ".rp", "cache", "plans"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	planner := []byte(`version: rp.dev/v0.1
+capabilities:
+  ok:
+    purpose: observe
+    kind: command
+    inputs: {}
+    outputs:
+      result:
+        type: CommandResult
+    command:
+      cwd: "."
+      argv: [echo, ok]
+    effects:
+      external: local_process
+      filesystem:
+        writes: []
+goals:
+  smoke:
+    requires_evidence: []
+policies:
+  local_safe:
+    permissions: {}
+defaults:
+  policy: local_safe
+`)
+	if err := os.WriteFile(filepath.Join(dir, ".rp", "planner.yaml"), planner, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	oldStdout := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stdout = w
+	err = cmdPlan([]string{"smoke", "--speculative"})
+	w.Close()
+	os.Stdout = oldStdout
+	if err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	_, _ = buf.ReadFrom(r)
+	if !strings.Contains(buf.String(), "speculative") {
+		t.Fatalf("expected speculative output, got %q", buf.String())
+	}
+	entries, err := os.ReadDir(filepath.Join(dir, ".rp", "cache", "plans"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("speculative plan should not save snapshot, found %d files", len(entries))
+	}
+}
+
 func TestCheckCapabilityPolicyRejectsForbiddenNetwork(t *testing.T) {
 	cfg := Config{
 		Defaults: map[string]string{"policy": "local_safe"},

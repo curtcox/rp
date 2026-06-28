@@ -27,7 +27,7 @@ Implemented commands include:
 - `goal init`
 - `policy init`
 - `add resource`, `resources`, `resource`
-- `plan` with `text`, `json`, `dot`, and `mermaid` output plus saved plan snapshots
+- `plan` with `text`, `json`, `dot`, and `mermaid` output plus saved plan snapshots (`--speculative` shows assumed preconditions without saving)
 - `exec` for saved plan execution
 - `achieve` with `--dry-run`, `--step`, `--yes`, `--auto-repair`, and `--max-attempts`
 - `evidence`, `why`, `trace`, `audit`, `replay`, `replan`, and `rerun`
@@ -41,7 +41,8 @@ replanning during `achieve`, executes command capabilities serially with
 execution-time precondition checks, supports `--auto-repair` retries governed by
 policy `execution.auto_repair`, records assertion supersession when evidence is
 corrected, writes a goal attestation bundle when evidence requirements are met,
-writes artifacts under
+honors policy `hashing` rules for command output and file artifacts, prints an
+effect summary with plans and runs, writes artifacts under
 `.rp/runs/<run-id>/artifacts`, records append-only JSONL events (including
 `action_failed` for non-zero exits when `always_record_result` is set), and
 explains assertions from the latest run. Use `rp replay RUN_ID` for a narrative

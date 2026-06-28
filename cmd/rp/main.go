@@ -487,11 +487,10 @@ func cmdPlan(args []string) error {
 	fs := flag.NewFlagSet("plan", flag.ContinueOnError)
 	explain := fs.Bool("explain", false, "explain plan")
 	format := fs.String("format", "text", "text|json|dot|mermaid")
-	speculative := fs.Bool("speculative", false, "accepted for v0.1 compatibility")
+	speculative := fs.Bool("speculative", false, "show assumed preconditions without saving a plan snapshot")
 	if err := fs.Parse(normalizeFlagArgs(args, map[string]bool{"format": true}, map[string]bool{"explain": true, "speculative": true})); err != nil {
 		return err
 	}
-	_ = speculative
 	if fs.NArg() != 1 {
 		return errors.New("usage: rp plan GOAL")
 	}
@@ -503,25 +502,42 @@ func cmdPlan(args []string) error {
 	if err != nil {
 		return err
 	}
-	saved, err := savePlan(root, fs.Arg(0), hash, hashPolicy(cfg), plan)
-	if err != nil {
-		return err
+	var saved SavedPlan
+	if !*speculative {
+		saved, err = savePlan(root, fs.Arg(0), hash, hashPolicy(cfg), plan)
+		if err != nil {
+			return err
+		}
 	}
 	switch *format {
 	case "json":
+		if *speculative {
+			return printJSON(map[string]interface{}{
+				"goal": fs.Arg(0), "speculative": true, "steps": plan,
+				"assumptions": planAssumptions(cfg, plan), "effects": summarizePlanEffects(cfg, plan),
+			})
+		}
 		return printJSON(saved)
 	case "dot":
 		fmt.Print(renderDOT(plan))
 	case "mermaid":
 		fmt.Print(renderMermaid(plan))
 	case "text":
-		fmt.Printf("Goal: %s\nConfig: %s\nRoot: %s\nSaved plan: %s\n\n", fs.Arg(0), hash[:12], root, saved.ID)
+		if *speculative {
+			fmt.Printf("Goal: %s (speculative — plan not saved)\nConfig: %s\nRoot: %s\n\n", fs.Arg(0), hash[:12], root)
+		} else {
+			fmt.Printf("Goal: %s\nConfig: %s\nRoot: %s\nSaved plan: %s\n\n", fs.Arg(0), hash[:12], root, saved.ID)
+		}
 		for i, step := range plan {
 			fmt.Printf("%d. %s\n   capability: %s\n   reason: %s\n", i+1, step.ID, step.Capability, step.Reason)
 			if *explain {
 				fmt.Printf("   inputs: %v\n", step.Inputs)
 			}
 		}
+		if *speculative {
+			printPlanAssumptions(cfg, plan)
+		}
+		printEffectSummary(cfg, plan)
 	default:
 		return fmt.Errorf("unsupported format %q", *format)
 	}
@@ -593,6 +609,7 @@ func runPlan(root string, cfg Config, configHash, goalName string, plan []PlanSt
 		for i, step := range plan {
 			fmt.Printf("  %d. %s — %s\n", i+1, step.Capability, step.Reason)
 		}
+		printEffectSummary(cfg, plan)
 	} else {
 		appendEvent(ctx, "plan_revised", "", map[string]interface{}{"steps": plan, "reason": "replan from prior run"})
 		fmt.Printf("Replan for %s in %s (%d steps):\n", goalName, ctx.RunID, len(plan))
@@ -881,10 +898,16 @@ func cmdObserve(args []string) error {
 	obsID := "obs-" + actionID
 	evidenceID := "ev-" + actionID
 	appendEvent(ctx, "action_started", actionID, map[string]interface{}{"observer": "git_status", "resource": fs.Arg(0)})
-	appendEvent(ctx, "observation_recorded", actionID, map[string]interface{}{
+	obsData := map[string]interface{}{
 		"id": obsID, "source_type": "process_exit", "exit_code": exitCode,
-		"stdout_sha256": sha(stdout.Bytes()), "stderr_sha256": sha(stderr.Bytes()),
-	})
+	}
+	if policyHashing(cfg, "command_stdout") {
+		obsData["stdout_sha256"] = sha(stdout.Bytes())
+	}
+	if policyHashing(cfg, "command_stderr") {
+		obsData["stderr_sha256"] = sha(stderr.Bytes())
+	}
+	appendEvent(ctx, "observation_recorded", actionID, obsData)
 	appendEvent(ctx, "evidence_recorded", actionID, map[string]interface{}{
 		"id": evidenceID, "source_type": "process_exit", "observation_id": obsID,
 		"confidence_contribution": "observed",
@@ -1935,11 +1958,17 @@ func executeStep(ctx RunContext, cfg Config, step PlanStep, resources map[string
 	}
 	obsID := "obs-" + actionID
 	evidenceID := "ev-" + actionID
-	saveStreams(ctx, capability, step, resources, stdout.Bytes(), stderr.Bytes())
-	appendEvent(ctx, "observation_recorded", actionID, map[string]interface{}{
+	saveStreams(ctx, cfg, capability, step, resources, stdout.Bytes(), stderr.Bytes())
+	obsData := map[string]interface{}{
 		"id": obsID, "source_type": "process_exit", "exit_code": exitCode,
-		"stdout_sha256": sha(stdout.Bytes()), "stderr_sha256": sha(stderr.Bytes()),
-	})
+	}
+	if policyHashing(cfg, "command_stdout") {
+		obsData["stdout_sha256"] = sha(stdout.Bytes())
+	}
+	if policyHashing(cfg, "command_stderr") {
+		obsData["stderr_sha256"] = sha(stderr.Bytes())
+	}
+	appendEvent(ctx, "observation_recorded", actionID, obsData)
 	appendEvent(ctx, "evidence_recorded", actionID, map[string]interface{}{
 		"id": evidenceID, "source_type": "process_exit", "observation_id": obsID,
 		"confidence_contribution": "observed",
@@ -1947,10 +1976,14 @@ func executeStep(ctx RunContext, cfg Config, step PlanStep, resources map[string
 	for outName, out := range capability.Outputs {
 		if capability.Command.Stdout.SaveAs.Resource == outName {
 			resources[outName] = outName
-			appendEvent(ctx, "resource_realization_recorded", actionID, map[string]interface{}{
+			realizationData := map[string]interface{}{
 				"resource": outName, "artifact": capability.Command.Stdout.SaveAs.ArtifactPath,
 				"media_type": capability.Command.Stdout.SaveAs.MediaType,
-			})
+			}
+			if policyHashing(cfg, "file_backed_realizations") {
+				realizationData["sha256"] = sha(stdout.Bytes())
+			}
+			appendEvent(ctx, "resource_realization_recorded", actionID, realizationData)
 		}
 		for _, as := range out.Assertions {
 			if assertionMatches(as, exitCode, stdout.String()) {
@@ -2007,26 +2040,30 @@ func substitute(s string, ctx RunContext, cfg Config, step PlanStep, resources m
 	return out
 }
 
-func saveStreams(ctx RunContext, cap Capability, step PlanStep, resources map[string]string, stdout, stderr []byte) {
+func saveStreams(ctx RunContext, cfg Config, cap Capability, step PlanStep, resources map[string]string, stdout, stderr []byte) {
 	if p := cap.Command.Stdout.SaveAs.ArtifactPath; p != "" {
-		writeArtifact(ctx, p, stdout)
+		writeArtifact(ctx, cfg, p, stdout)
 	}
 	if p := cap.Command.Stdout.SaveAsArtifact; p != "" {
-		writeArtifact(ctx, p, stdout)
+		writeArtifact(ctx, cfg, p, stdout)
 	}
 	if p := cap.Command.Stderr.SaveAsArtifact; p != "" {
-		writeArtifact(ctx, p, stderr)
+		writeArtifact(ctx, cfg, p, stderr)
 	}
 }
 
-func writeArtifact(ctx RunContext, rel string, b []byte) {
+func writeArtifact(ctx RunContext, cfg Config, rel string, b []byte) {
 	path := filepath.Join(ctx.RunDir, rel)
 	if !strings.HasPrefix(rel, "artifacts/") {
 		path = filepath.Join(ctx.Artifacts, rel)
 	}
 	_ = os.MkdirAll(filepath.Dir(path), 0755)
 	_ = os.WriteFile(path, b, 0644)
-	appendEvent(ctx, "artifact_recorded", "", map[string]interface{}{"path": path, "sha256": sha(b)})
+	data := map[string]interface{}{"path": path}
+	if policyHashing(cfg, "file_backed_realizations") {
+		data["sha256"] = sha(b)
+	}
+	appendEvent(ctx, "artifact_recorded", "", data)
 }
 
 func newRun(root, configHash, policyHash string) (RunContext, error) {
@@ -2565,6 +2602,119 @@ func resolveSubject(subject string, step PlanStep) string {
 		return "patched_repo"
 	}
 	return subject
+}
+
+type PlanEffectSummary struct {
+	External         []string `json:"external,omitempty"`
+	FilesystemWrites []string `json:"filesystem_writes,omitempty"`
+	NeedsApproval    []string `json:"needs_approval,omitempty"`
+}
+
+func summarizePlanEffects(cfg Config, plan []PlanStep) PlanEffectSummary {
+	var summary PlanEffectSummary
+	seenWrites := map[string]bool{}
+	seenExt := map[string]bool{}
+	for _, step := range plan {
+		capability := cfg.Capabilities[step.Capability]
+		for _, w := range capability.Effects.Filesystem["writes"] {
+			if w != "" && !seenWrites[w] {
+				seenWrites[w] = true
+				summary.FilesystemWrites = append(summary.FilesystemWrites, w)
+			}
+		}
+		if capability.Effects.External != "" && !seenExt[capability.Effects.External] {
+			seenExt[capability.Effects.External] = true
+			summary.External = append(summary.External, capability.Effects.External)
+		}
+		if needsWriteApproval(cfg, capability) {
+			summary.NeedsApproval = append(summary.NeedsApproval, step.Capability)
+		}
+	}
+	sort.Strings(summary.FilesystemWrites)
+	sort.Strings(summary.External)
+	sort.Strings(summary.NeedsApproval)
+	return summary
+}
+
+func printEffectSummary(cfg Config, plan []PlanStep) {
+	summary := summarizePlanEffects(cfg, plan)
+	if len(summary.FilesystemWrites) == 0 && len(summary.External) == 0 && len(summary.NeedsApproval) == 0 {
+		return
+	}
+	fmt.Println("\nEffect summary:")
+	if len(summary.External) > 0 {
+		fmt.Printf("  external: %s\n", strings.Join(summary.External, ", "))
+	}
+	if len(summary.FilesystemWrites) > 0 {
+		fmt.Println("  filesystem writes:")
+		for _, w := range summary.FilesystemWrites {
+			fmt.Printf("    - %s\n", w)
+		}
+	}
+	if len(summary.NeedsApproval) > 0 {
+		fmt.Printf("  approval required: %s\n", strings.Join(summary.NeedsApproval, ", "))
+	}
+}
+
+func planAssumptions(cfg Config, plan []PlanStep) []string {
+	var out []string
+	seen := map[string]bool{}
+	for _, step := range plan {
+		capability := cfg.Capabilities[step.Capability]
+		for inputName, input := range capability.Inputs {
+			for _, req := range input.Requires {
+				subject := req.Subject
+				if subject == "" {
+					subject = step.Inputs[inputName]
+				}
+				if subject == "" {
+					subject = inputName
+				}
+				line := fmt.Sprintf("%s.%s>=%s (required by %s)", subject, req.Predicate, req.MinConfidence, step.Capability)
+				if !seen[line] {
+					seen[line] = true
+					out = append(out, line)
+				}
+			}
+		}
+		for _, req := range capability.Preconditions {
+			subject := req.Subject
+			if subject == "" {
+				subject = step.Inputs["repo"]
+			}
+			line := fmt.Sprintf("%s.%s>=%s (required by %s)", subject, req.Predicate, req.MinConfidence, step.Capability)
+			if !seen[line] {
+				seen[line] = true
+				out = append(out, line)
+			}
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+func printPlanAssumptions(cfg Config, plan []PlanStep) {
+	assumptions := planAssumptions(cfg, plan)
+	if len(assumptions) == 0 {
+		return
+	}
+	fmt.Println("\nAssumed preconditions (speculative):")
+	for _, line := range assumptions {
+		fmt.Printf("  - %s\n", line)
+	}
+}
+
+func policyHashing(cfg Config, key string) bool {
+	pol := activePolicy(cfg)
+	if pol.Hashing == nil {
+		return false
+	}
+	v, ok := pol.Hashing[key]
+	if !ok {
+		return false
+	}
+	b, ok := v.(bool)
+	return ok && b
 }
 
 func renderDOT(plan []PlanStep) string {
