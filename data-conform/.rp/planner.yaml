@@ -1,0 +1,22 @@
+version: rp.dev/v0.1
+imports:
+  - capabilities/data.yaml
+  - policies/local-safe.yaml
+  - goals/conform.yaml
+resources:
+  dataset:
+    type: Dataset
+    realizations:
+      - id: dataset.raw
+        kind: file
+        uri: file://data/raw.csv
+        media_type: text/csv
+  schema:
+    type: SchemaSpec
+    realizations:
+      - id: schema.conformance
+        kind: file
+        uri: file://schema/spec.yaml
+        media_type: application/yaml
+defaults:
+  policy: local_safe

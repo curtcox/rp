@@ -128,6 +128,139 @@ func TestBuildPlanGeneralizesBeyondBugfix(t *testing.T) {
 	}
 }
 
+func TestFindAssertionCapabilityPrefersRequirementSatisfyingSource(t *testing.T) {
+	cfg := Config{
+		Defaults: map[string]string{"policy": "trust_limited"},
+		Policies: map[string]Policy{"trust_limited": {
+			Evidence: map[string]interface{}{
+				"final_goal_rules": []interface{}{
+					map[string]interface{}{"source_type": "llm_claim", "may_satisfy_required_evidence": false},
+				},
+			},
+		}},
+		Capabilities: map[string]Capability{
+			"translate": {
+				Outputs: map[string]OutputSpec{"doc": {Assertions: []AssertionSpec{{
+					Subject: "translated_doc", Predicate: "translation_valid",
+					Confidence: "claimed", EvidenceSource: "llm_claim",
+				}}}},
+			},
+			"check_translation": {
+				Outputs: map[string]OutputSpec{"check": {Assertions: []AssertionSpec{{
+					Subject: "translated_doc", Predicate: "translation_valid",
+					Confidence: "observed", EvidenceSource: "command_result",
+				}}}},
+			},
+		},
+	}
+	req := Requirement{
+		Subject: "translated_doc", Predicate: "translation_valid",
+		MinConfidence: "observed", AnySourceType: []string{"command_result"},
+	}
+	if got := findAssertionCapabilityForReq(cfg, req); got != "check_translation" {
+		t.Fatalf("expected check_translation, got %q", got)
+	}
+}
+
+func TestBuildPlanAnnotatesPolicyBlocks(t *testing.T) {
+	cfg := Config{
+		Defaults: map[string]string{"policy": "ci_safe"},
+		Policies: map[string]Policy{"ci_safe": {
+			Permissions: map[string]interface{}{
+				"external_side_effects": map[string]interface{}{"create_pull_request": "forbidden"},
+			},
+		}},
+		Resources: map[string]Resource{"codebase": {Type: "SourceTree"}},
+		Capabilities: map[string]Capability{
+			"run_lint": {
+				Purpose: "observe",
+				Inputs:  map[string]InputSpec{"codebase": {Type: "SourceTree"}},
+				Outputs: map[string]OutputSpec{"lint": {Assertions: []AssertionSpec{{
+					Subject: "codebase", Predicate: "lint_clean", Confidence: "observed",
+				}}}},
+			},
+			"create_pull_request": {
+				Purpose: "derive",
+				Inputs: map[string]InputSpec{"codebase": {Type: "SourceTree", Requires: []Requirement{{
+					Predicate: "lint_clean", MinConfidence: "observed",
+				}}}},
+				Outputs: map[string]OutputSpec{"release_candidate": {}},
+				Effects: EffectSpec{ExternalSideEffects: map[string]interface{}{"create_pull_request": true}},
+			},
+		},
+		Goals: map[string]Goal{
+			"release_candidate": {
+				Given:   map[string]string{"codebase": "codebase"},
+				Produce: map[string]OutputSpec{"release_candidate": {}},
+				RequiresEvidence: []Requirement{{
+					Subject: "codebase", Predicate: "lint_clean", MinConfidence: "observed",
+				}},
+			},
+		},
+	}
+	plan, err := buildPlan(cfg, "release_candidate")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var blocked bool
+	for _, step := range plan {
+		if step.Capability == "create_pull_request" {
+			blocked = step.PolicyBlocked && strings.Contains(step.PolicyReason, "create_pull_request")
+		}
+	}
+	if !blocked {
+		t.Fatalf("expected create_pull_request to be policy blocked, got %+v", plan)
+	}
+	if len(executablePlanSteps(plan)) == 0 {
+		t.Fatal("expected at least one executable step")
+	}
+}
+
+func TestBuildPlanIncludesRepairCapabilitiesOnDemand(t *testing.T) {
+	cfg := Config{
+		Resources: map[string]Resource{"service": {Type: "ServiceConfig"}},
+		Capabilities: map[string]Capability{
+			"run_tests": {
+				Purpose: "observe",
+				Inputs:  map[string]InputSpec{"service": {Type: "ServiceConfig"}},
+				Outputs: map[string]OutputSpec{"result": {Assertions: []AssertionSpec{{
+					Subject: "service", Predicate: "tests_pass", Confidence: "observed",
+				}}}},
+			},
+			"repair_config": {
+				Purpose: "repair",
+				Inputs:  map[string]InputSpec{"service": {Type: "ServiceConfig"}},
+				Outputs: map[string]OutputSpec{"repair": {Assertions: []AssertionSpec{{
+					Subject: "service", Predicate: "config_repaired", Confidence: "observed",
+				}}}},
+			},
+		},
+		Goals: map[string]Goal{
+			"service_green": {
+				Given: map[string]string{"service": "service"},
+				RequiresEvidence: []Requirement{{
+					Subject: "service", Predicate: "tests_pass", MinConfidence: "observed",
+				}},
+			},
+		},
+	}
+	plan, err := buildPlan(cfg, "service_green")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan) != 1 || plan[0].Capability != "run_tests" {
+		t.Fatalf("initial plan = %+v, want only run_tests", plan)
+	}
+	plan, err = buildPlan(cfg, "service_green", buildPlanOptions{includeRepair: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	caps := planCapabilities(plan)
+	if !containsString(caps, "repair_config") {
+		t.Fatalf("repair replan should include repair_config, got %+v", caps)
+	}
+}
+
 func TestMergePoliciesMostRestrictive(t *testing.T) {
 	project := Policy{Permissions: map[string]interface{}{
 		"network":     map[string]interface{}{"access": "allowed"},

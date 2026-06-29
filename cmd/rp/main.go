@@ -389,6 +389,9 @@ func cmdPlan(args []string) error {
 		}
 		for i, step := range plan {
 			fmt.Printf("%d. %s\n   capability: %s\n   reason: %s\n", i+1, step.ID, step.Capability, step.Reason)
+			if step.PolicyBlocked {
+				fmt.Printf("   policy blocked: %s\n", step.PolicyReason)
+			}
 			if *explain {
 				fmt.Printf("   inputs: %v\n", step.Inputs)
 			}
@@ -505,14 +508,18 @@ func runPlan(root string, cfg Config, configHash, goalName string, plan []PlanSt
 		}
 	}
 	failureCount := 0
+	includeRepair := false
 	lastPlanCaps := planCapabilities(plan)
 	for {
-		if len(missingEvidenceWithConfig(ctx.RunDir, goal, cfg)) == 0 {
+		missingEv := missingEvidenceWithConfig(ctx.RunDir, goal, cfg)
+		missingProd := missingProduce(ctx.RunDir, goal)
+		if len(missingEv) == 0 && len(missingProd) == 0 {
 			break
 		}
 		var steps []PlanStep
 		if jit {
-			steps, err = buildPlan(cfg, goalName)
+			steps, err = buildPlan(cfg, goalName, buildPlanOptions{includeRepair: includeRepair})
+			includeRepair = false
 			if err != nil {
 				appendEvent(ctx, "run_stopped", "", map[string]interface{}{"reason": err.Error()})
 				writeSummary(ctx, goalName, false, err.Error(), missingEvidenceWithConfig(ctx.RunDir, goal, cfg), missingProduce(ctx.RunDir, goal))
@@ -589,6 +596,7 @@ func runPlan(root string, cfg Config, configHash, goalName string, plan []PlanSt
 					"attempt": failureCount, "max_attempts": maxAttempts, "capability": step.Capability,
 				})
 				fmt.Printf("auto-repair: replanning after %s failure (%d/%d)\n", step.Capability, failureCount, maxAttempts)
+				includeRepair = true
 				continue
 			}
 			stopData, summaryReason := failureStopData(cfg, ctx.RunID, err.Error())
@@ -602,8 +610,8 @@ func runPlan(root string, cfg Config, configHash, goalName string, plan []PlanSt
 			"missing_count": len(missing),
 			"missing":       missing,
 		})
-		if len(missing) == 0 {
-			appendEvent(ctx, "run_stopped", step.ID, map[string]interface{}{"reason": "goal evidence requirements satisfied"})
+		if len(missing) == 0 && len(missingProduce(ctx.RunDir, goal)) == 0 {
+			appendEvent(ctx, "run_stopped", step.ID, map[string]interface{}{"reason": "goal evidence and produce requirements satisfied"})
 			break
 		}
 		if !jit {
@@ -1763,7 +1771,15 @@ func mergeConfig(dst *Config, src Config) {
 	}
 }
 
-func buildPlan(cfg Config, goalName string) ([]PlanStep, error) {
+type buildPlanOptions struct {
+	includeRepair bool
+}
+
+func buildPlan(cfg Config, goalName string, opts ...buildPlanOptions) ([]PlanStep, error) {
+	var opt buildPlanOptions
+	if len(opts) > 0 {
+		opt = opts[0]
+	}
 	goal, ok := cfg.Goals[goalName]
 	if !ok {
 		return nil, fmt.Errorf("goal %q not found", goalName)
@@ -1782,18 +1798,6 @@ func buildPlan(cfg Config, goalName string) ([]PlanStep, error) {
 		repoName = firstResourceOfType(cfg, "GitRepo")
 	}
 	bugName := goal.Given["bug_report"]
-	for capName, cap := range cfg.Capabilities {
-		for _, in := range cap.Inputs {
-			for _, req := range in.Requires {
-				if req.Predicate == "clean_worktree" {
-					if obs := findAssertionCapability(cfg, "repo", "clean_worktree"); obs != "" {
-						add(obs, "observe precondition clean_worktree", map[string]string{"repo": repoName})
-					}
-					_ = capName
-				}
-			}
-		}
-	}
 	for _, resName := range sortedKeys(goal.Produce) {
 		if capName := findOutputCapability(cfg, resName); capName != "" {
 			add(capName, "produce "+resName+" resource", planInputs(cfg, goal, cfg.Capabilities[capName], repoName, bugName))
@@ -1802,7 +1806,7 @@ func buildPlan(cfg Config, goalName string) ([]PlanStep, error) {
 	for _, req := range goal.RequiresEvidence {
 		switch {
 		case req.Subject == "patch" && req.Predicate == "applies_cleanly":
-			if capName := findAssertionCapability(cfg, "patch", "applies_cleanly"); capName != "" {
+			if capName := findAssertionCapabilityForReq(cfg, req); capName != "" {
 				add(capName, "observe patch.applies_cleanly", map[string]string{"repo": repoName, "patch": "patch"})
 			}
 		case req.Subject == "patched_repo" || req.Subject == "repo":
@@ -1811,7 +1815,8 @@ func buildPlan(cfg Config, goalName string) ([]PlanStep, error) {
 					add(capName, "derive patched_repo", map[string]string{"repo": repoName, "patch": "patch"})
 				}
 			}
-			if capName := findAssertionCapability(cfg, "repo", req.Predicate); capName != "" {
+			lookup := Requirement{Subject: "repo", Predicate: req.Predicate, MinConfidence: req.MinConfidence, AnySourceType: req.AnySourceType}
+			if capName := findAssertionCapabilityForReq(cfg, lookup); capName != "" {
 				subject := repoName
 				if req.Subject == "patched_repo" {
 					subject = "patched_repo"
@@ -1828,11 +1833,17 @@ func buildPlan(cfg Config, goalName string) ([]PlanStep, error) {
 					add(capName, "derive "+req.Subject, planInputs(cfg, goal, cfg.Capabilities[capName], repoName, bugName))
 				}
 			}
-			if capName := findAssertionCapability(cfg, req.Subject, req.Predicate); capName != "" {
+			if capName := findAssertionCapabilityForReq(cfg, req); capName != "" {
 				add(capName, "observe "+req.Subject+"."+req.Predicate, planInputs(cfg, goal, cfg.Capabilities[capName], repoName, bugName))
 			}
 		}
 	}
+	if opt.includeRepair {
+		for _, name := range findRepairCapabilities(cfg) {
+			add(name, "repair after failure", planInputs(cfg, goal, cfg.Capabilities[name], repoName, bugName))
+		}
+	}
+	planPreconditionsForPlanned(cfg, goal, seen, add, repoName, bugName)
 	if len(steps) == 0 && len(cfg.Capabilities) == 1 {
 		for name := range cfg.Capabilities {
 			add(name, "single available capability", map[string]string{})
@@ -1841,12 +1852,12 @@ func buildPlan(cfg Config, goalName string) ([]PlanStep, error) {
 	if len(steps) == 0 {
 		return nil, errors.New("no plan found")
 	}
-	steps = filterPlanByPolicy(cfg, steps)
-	if len(steps) == 0 {
-		return nil, errors.New("no plan found under active policy")
+	steps = annotatePlanPolicyBlocks(cfg, steps)
+	if len(executablePlanSteps(steps)) == 0 {
+		return nil, fmt.Errorf("no plan found under active policy: %s", firstPolicyBlockReason(steps))
 	}
 	steps = filterPlanByConstraints(cfg, goal, steps)
-	if len(steps) == 0 {
+	if len(executablePlanSteps(steps)) == 0 {
 		return nil, errors.New("no plan found under goal constraints")
 	}
 	if err := validatePlanMaxCost(cfg, goal, steps); err != nil {
@@ -1857,6 +1868,33 @@ func buildPlan(cfg Config, goalName string) ([]PlanStep, error) {
 		steps[i].ID = fmt.Sprintf("step-%02d", i+1)
 	}
 	return steps, nil
+}
+
+// planPreconditionsForPlanned adds observing steps for input preconditions of
+// capabilities already selected for the plan (e.g. gate checks before a PR step).
+func planPreconditionsForPlanned(cfg Config, goal Goal, planned map[string]bool, add func(string, string, map[string]string), repoName, bugName string) {
+	for capName := range planned {
+		cap := cfg.Capabilities[capName]
+		for inName, in := range cap.Inputs {
+			for _, req := range in.Requires {
+				subject := req.Subject
+				if subject == "" {
+					subject = resolveInputResource(cfg, goal, inName, in, repoName, bugName)
+				}
+				full := req
+				full.Subject = subject
+				obsCap := findAssertionCapabilityForReq(cfg, full)
+				if obsCap == "" {
+					continue
+				}
+				reason := fmt.Sprintf("observe precondition %s.%s", subject, req.Predicate)
+				if req.Predicate == "clean_worktree" {
+					reason = "observe precondition clean_worktree"
+				}
+				add(obsCap, reason, planInputs(cfg, goal, cfg.Capabilities[obsCap], repoName, bugName))
+			}
+		}
+	}
 }
 
 // planInputs resolves each input of a capability to a concrete resource name so
@@ -2003,6 +2041,9 @@ func planStepPriority(cfg Config, step PlanStep) int {
 	if !ok {
 		return 100
 	}
+	if capability.Purpose == "repair" {
+		return 15
+	}
 	for _, out := range capability.Outputs {
 		for _, as := range out.Assertions {
 			switch as.Predicate {
@@ -2148,6 +2189,9 @@ func substitute(s string, ctx RunContext, cfg Config, step PlanStep, resources m
 		}
 		if res, ok := cfg.Resources[name]; ok {
 			return pathFromURI(ctx.Root, realizationURI(res))
+		}
+		if rec, ok := realizationsFromRun(ctx.RunDir)[name]; ok && rec.Artifact != "" {
+			return filepath.Join(ctx.RunDir, rec.Artifact)
 		}
 		return name
 	})
@@ -2800,21 +2844,94 @@ func findOutputCapability(cfg Config, output string) string {
 	return ""
 }
 
-func findAssertionCapability(cfg Config, subject, predicate string) string {
+// findAssertionCapabilityForReq picks the capability whose assertion can satisfy
+// the requirement: matching subject/predicate, confidence at or above the minimum,
+// an allowed evidence source, and a source policy permits for required evidence.
+func findAssertionCapabilityForReq(cfg Config, req Requirement) string {
+	var best string
+	bestRank := -1
 	for _, name := range sortedKeys(cfg.Capabilities) {
 		cap := cfg.Capabilities[name]
 		for _, out := range cap.Outputs {
 			for _, as := range out.Assertions {
-				if as.Predicate != predicate {
+				if as.Predicate != req.Predicate {
 					continue
 				}
-				if as.Subject == subject || as.Subject == "" || subject == "" {
-					return name
+				subject := req.Subject
+				if subject == "" {
+					subject = as.Subject
+				}
+				if as.Subject != subject && as.Subject != "" && subject != "" {
+					continue
+				}
+				confidence := as.Confidence
+				source := as.EvidenceSource
+				if confidence != "" && !model.ConfidenceAtLeast(confidence, req.MinConfidence) {
+					continue
+				}
+				if source == "" {
+					source = "process_exit"
+				}
+				if len(req.AnySourceType) > 0 && !sourceAllowed(source, req.AnySourceType) {
+					continue
+				}
+				if !sourceMaySatisfyRequiredEvidence(cfg, source) {
+					continue
+				}
+				if confidence == "" {
+					confidence = req.MinConfidence
+				}
+				rank := model.ConfidenceRank[confidence]
+				if best == "" || rank > bestRank || (rank == bestRank && name < best) {
+					best = name
+					bestRank = rank
 				}
 			}
 		}
 	}
-	return ""
+	return best
+}
+
+func findRepairCapabilities(cfg Config) []string {
+	var names []string
+	for _, name := range sortedKeys(cfg.Capabilities) {
+		if cfg.Capabilities[name].Purpose == "repair" {
+			names = append(names, name)
+		}
+	}
+	return names
+}
+
+func annotatePlanPolicyBlocks(cfg Config, steps []PlanStep) []PlanStep {
+	out := make([]PlanStep, len(steps))
+	copy(out, steps)
+	for i := range out {
+		capability := cfg.Capabilities[out[i].Capability]
+		if err := checkCapabilityPolicy(cfg, capability); err != nil {
+			out[i].PolicyBlocked = true
+			out[i].PolicyReason = err.Error()
+		}
+	}
+	return out
+}
+
+func executablePlanSteps(steps []PlanStep) []PlanStep {
+	var out []PlanStep
+	for _, step := range steps {
+		if !step.PolicyBlocked {
+			out = append(out, step)
+		}
+	}
+	return out
+}
+
+func firstPolicyBlockReason(steps []PlanStep) string {
+	for _, step := range steps {
+		if step.PolicyBlocked && step.PolicyReason != "" {
+			return step.PolicyReason
+		}
+	}
+	return "all steps blocked by policy"
 }
 
 func filterPlanByPolicy(cfg Config, steps []PlanStep) []PlanStep {
@@ -3403,6 +3520,23 @@ func printEffectSummary(cfg Config, plan []PlanStep) {
 	}
 	if len(summary.NeedsApproval) > 0 {
 		fmt.Printf("  approval required: %s\n", strings.Join(summary.NeedsApproval, ", "))
+	}
+	printPlanPolicyBlocks(plan)
+}
+
+func printPlanPolicyBlocks(plan []PlanStep) {
+	var blocked []string
+	for _, step := range plan {
+		if step.PolicyBlocked {
+			blocked = append(blocked, fmt.Sprintf("%s (%s)", step.Capability, step.PolicyReason))
+		}
+	}
+	if len(blocked) == 0 {
+		return
+	}
+	fmt.Println("\nPolicy blocks:")
+	for _, line := range blocked {
+		fmt.Printf("  - %s\n", line)
 	}
 }
 

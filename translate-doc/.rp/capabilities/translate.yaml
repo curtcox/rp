@@ -1,0 +1,84 @@
+version: rp.dev/v0.1
+capabilities:
+  translate:
+    purpose: derive
+    kind: command
+    inputs:
+      source_doc:
+        type: SourceDoc
+    outputs:
+      translated_doc:
+        type: TranslatedDoc
+        realization:
+          kind: file
+          media_type: text/markdown
+        assertions:
+          - subject: translated_doc
+            predicate: translation_valid
+            confidence: claimed
+            when:
+              exit_code: 0
+            evidence_source: llm_claim
+    command:
+      cwd: "."
+      argv:
+        - ./scripts/translate.sh
+        - "${inputs.source_doc.path}"
+      stdout:
+        save_as:
+          resource: translated_doc
+          artifact_path: artifacts/readme.fr.md
+          media_type: text/markdown
+    always_record_result: true
+    effects:
+      external: local_process
+      filesystem:
+        writes:
+          - ".rp/runs/${run.id}/artifacts/readme.fr.md"
+    nondeterminism:
+      - external_process
+    idempotence: unknown
+    cost:
+      time: moderate
+      money_usd: 0
+      tokens: 40000
+      risk: medium
+      human_attention: none
+  check_translation:
+    purpose: observe
+    kind: command
+    inputs:
+      source_doc:
+        type: SourceDoc
+      translated_doc:
+        type: TranslatedDoc
+    outputs:
+      verification:
+        type: CommandResult
+        assertions:
+          - subject: translated_doc
+            predicate: translation_valid
+            confidence: observed
+            when:
+              exit_code: 0
+            evidence_source: command_result
+    command:
+      cwd: "."
+      argv:
+        - ./scripts/check_translation.sh
+        - "${inputs.translated_doc.path}"
+      stdout:
+        save_as_artifact: verification.stdout
+        media_type: text/plain
+    always_record_result: true
+    effects:
+      external: local_process
+      filesystem:
+        writes: []
+    nondeterminism: []
+    idempotence: idempotent
+    cost:
+      time: cheap
+      money_usd: 0
+      risk: low
+      human_attention: none

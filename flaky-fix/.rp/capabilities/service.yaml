@@ -1,0 +1,79 @@
+version: rp.dev/v0.1
+capabilities:
+  run_tests:
+    purpose: observe
+    kind: command
+    inputs:
+      service:
+        type: ServiceConfig
+    outputs:
+      test_result:
+        type: CommandResult
+        assertions:
+          - subject: service
+            predicate: tests_pass
+            confidence: observed
+            when:
+              exit_code: 0
+            evidence_source: process_exit
+    command:
+      cwd: "."
+      argv:
+        - ./scripts/run_tests.sh
+      stdout:
+        save_as_artifact: tests.stdout
+        media_type: text/plain
+      stderr:
+        save_as_artifact: tests.stderr
+        media_type: text/plain
+    always_record_result: true
+    effects:
+      external: local_process
+      filesystem:
+        writes: []
+    nondeterminism: []
+    idempotence: idempotent
+    cost:
+      time: cheap
+      money_usd: 0
+      risk: low
+      human_attention: none
+  repair_config:
+    purpose: repair
+    kind: command
+    inputs:
+      service:
+        type: ServiceConfig
+    outputs:
+      repair_result:
+        type: CommandResult
+        assertions:
+          - subject: service
+            predicate: config_repaired
+            confidence: observed
+            when:
+              exit_code: 0
+            evidence_source: command_result
+    command:
+      cwd: "."
+      argv:
+        - ./scripts/repair_config.sh
+      stdout:
+        save_as_artifact: repair.stdout
+        media_type: text/plain
+    approval:
+      required_if:
+        - permission: filesystem.write
+    always_record_result: true
+    effects:
+      external: local_filesystem_write
+      filesystem:
+        writes:
+          - config/app.env
+    nondeterminism: []
+    idempotence: idempotent
+    cost:
+      time: cheap
+      money_usd: 0
+      risk: medium
+      human_attention: approval_if_required

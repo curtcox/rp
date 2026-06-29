@@ -124,10 +124,12 @@ type Goal struct {
 }
 
 type PlanStep struct {
-	ID         string            `json:"id"`
-	Capability string            `json:"capability"`
-	Reason     string            `json:"reason"`
-	Inputs     map[string]string `json:"inputs"`
+	ID            string            `json:"id"`
+	Capability    string            `json:"capability"`
+	Reason        string            `json:"reason"`
+	Inputs        map[string]string `json:"inputs"`
+	PolicyBlocked bool              `json:"policy_blocked,omitempty"`
+	PolicyReason  string            `json:"policy_reason,omitempty"`
 }
 
 type SavedPlan struct {

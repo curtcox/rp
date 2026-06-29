@@ -1,0 +1,26 @@
+version: rp.dev/v0.1
+goals:
+  conforming_dataset:
+    description: Normalize a messy dataset and produce observed evidence it conforms to the schema.
+    given:
+      dataset: dataset
+      schema: schema
+    produce:
+      cleaned_dataset:
+        type: CleanedDataset
+        required_realization:
+          kind: file
+          media_type: text/csv
+    requires_evidence:
+      - subject: cleaned_dataset
+        predicate: conforms_to_schema
+        min_confidence: observed
+        any_source_type:
+          - command_result
+    constraints:
+      permissions:
+        network: forbidden
+        credentials: forbidden
+      max_cost:
+        time: 10m
+        money_usd: 0

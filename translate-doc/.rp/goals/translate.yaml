@@ -1,0 +1,26 @@
+version: rp.dev/v0.1
+goals:
+  translated_readme:
+    description: Translate readme.en.md and require independently verified translation quality.
+    given:
+      source_doc: source_doc
+    produce:
+      translated_doc:
+        type: TranslatedDoc
+        required_realization:
+          kind: file
+          media_type: text/markdown
+    requires_evidence:
+      - subject: translated_doc
+        predicate: translation_valid
+        min_confidence: observed
+        any_source_type:
+          - command_result
+    constraints:
+      permissions:
+        network: forbidden
+        credentials: forbidden
+      max_cost:
+        time: 10m
+        money_usd: 0
+        tokens: 50000

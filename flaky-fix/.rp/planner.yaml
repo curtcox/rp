@@ -1,0 +1,15 @@
+version: rp.dev/v0.1
+imports:
+  - capabilities/service.yaml
+  - policies/repair-enabled.yaml
+  - goals/service.yaml
+resources:
+  service:
+    type: ServiceConfig
+    realizations:
+      - id: service.local
+        kind: file
+        uri: file://config/app.env
+        media_type: text/plain
+defaults:
+  policy: repair_enabled

@@ -23,8 +23,10 @@ import (
 // Attributes:
 //   - id      unique identifier (used as the subtest name)
 //   - cwd     "empty" (fresh temp dir), "fixture" (a sandboxed copy of
-//             example-project, git-initialised), or "repro" (a sandboxed copy of
-//             the reproducible-build fixture); defaults to "empty"
+//             example-project, git-initialised), "repro" (a sandboxed copy of
+//             the reproducible-build fixture), "conform" (data-conform),
+//             "translate" (translate-doc), "gate" (release-gate), or
+//             "flaky" (flaky-fix); defaults to "empty"
 //   - status  "ready" (executed and asserted) or "todo" (a placeholder that is
 //             counted and skipped); defaults to "ready"
 //   - exit    expected exit code of the LAST command in the block (default 0)
@@ -336,10 +338,27 @@ func exampleSandbox(t *testing.T, cwd string) string {
 			t.Skip("reproducible-build fixture not present")
 		}
 		copyDir(t, exampleRoot, dir)
+	case "conform":
+		copyExampleFixture(t, dir, "data-conform")
+	case "translate":
+		copyExampleFixture(t, dir, "translate-doc")
+	case "gate":
+		copyExampleFixture(t, dir, "release-gate")
+	case "flaky":
+		copyExampleFixture(t, dir, "flaky-fix")
 	default:
-		t.Fatalf("unknown cwd %q (want empty|fixture|repro)", cwd)
+		t.Fatalf("unknown cwd %q (want empty|fixture|repro|conform|translate|gate|flaky)", cwd)
 	}
 	return dir
+}
+
+func copyExampleFixture(t *testing.T, dir, name string) {
+	t.Helper()
+	exampleRoot := filepath.Join("..", "..", name)
+	if _, err := os.Stat(filepath.Join(exampleRoot, ".rp", "planner.yaml")); err != nil {
+		t.Skipf("%s fixture not present", name)
+	}
+	copyDir(t, exampleRoot, dir)
 }
 
 func gitInitFixture(t *testing.T, dir string) {

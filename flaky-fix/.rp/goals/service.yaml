@@ -1,0 +1,20 @@
+version: rp.dev/v0.1
+goals:
+  service_green:
+    description: Demonstrate auto-repair after a deterministic test failure.
+    given:
+      service: service
+    requires_evidence:
+      - subject: service
+        predicate: tests_pass
+        min_confidence: observed
+        any_source_type:
+          - process_exit
+          - command_result
+    constraints:
+      permissions:
+        network: forbidden
+        credentials: forbidden
+      max_cost:
+        time: 10m
+        money_usd: 0

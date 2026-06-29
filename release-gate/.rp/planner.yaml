@@ -1,0 +1,15 @@
+version: rp.dev/v0.1
+imports:
+  - capabilities/gate.yaml
+  - policies/ci-safe.yaml
+  - goals/release.yaml
+resources:
+  codebase:
+    type: SourceTree
+    realizations:
+      - id: codebase.local
+        kind: local_path
+        uri: file://src
+        media_type: inode/directory
+defaults:
+  policy: ci_safe

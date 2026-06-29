@@ -1,0 +1,40 @@
+version: rp.dev/v0.1
+goals:
+  release_candidate:
+    description: >-
+      Gather lint, test, and scan evidence on the codebase, then produce a
+      release candidate artifact (opening a PR is a forbidden side effect).
+    given:
+      codebase: codebase
+    produce:
+      release_candidate:
+        type: ReleaseCandidate
+        required_realization:
+          kind: file
+          media_type: application/json
+    requires_evidence:
+      - subject: codebase
+        predicate: lint_clean
+        min_confidence: observed
+        any_source_type:
+          - process_exit
+          - command_result
+      - subject: codebase
+        predicate: tests_pass
+        min_confidence: observed
+        any_source_type:
+          - process_exit
+          - command_result
+      - subject: codebase
+        predicate: scan_clean
+        min_confidence: observed
+        any_source_type:
+          - process_exit
+          - command_result
+    constraints:
+      permissions:
+        network: forbidden
+        credentials: forbidden
+      max_cost:
+        time: 10m
+        money_usd: 0

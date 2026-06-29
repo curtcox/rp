@@ -55,6 +55,10 @@ NAV = [
     ("Tutorials", [
         ("tutorials/bugfix-walkthrough.md", "Bugfix walkthrough"),
         ("tutorials/reproducible-build.md", "Reproducible build"),
+        ("tutorials/data-conform.md", "Data conformance"),
+        ("tutorials/translate-doc.md", "Translation & trust"),
+        ("tutorials/release-gate.md", "Release gate & policy"),
+        ("tutorials/flaky-fix.md", "Flaky fix & auto-repair"),
         ("tutorials/writing-a-capability.md", "Writing a capability"),
         ("tutorials/defining-a-goal.md", "Defining a goal"),
     ]),

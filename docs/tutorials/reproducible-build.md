@@ -135,5 +135,6 @@ supported by assertion as-manual-attestation-binary-release_approved from action
 ## Next
 
 - [Bugfix walkthrough](bugfix-walkthrough.md) — the `observed`-only baseline.
+- [Translation & trust](translate-doc.md) — when LLM claims cannot satisfy a goal.
 - [Evidence & confidence](../internals/evidence.md) — how the ladder is enforced.
 - [`rp attest`](../cli/attest.md) — recording human judgement.

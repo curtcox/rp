@@ -1,0 +1,15 @@
+version: rp.dev/v0.1
+imports:
+  - capabilities/translate.yaml
+  - policies/trust-limited.yaml
+  - goals/translate.yaml
+resources:
+  source_doc:
+    type: SourceDoc
+    realizations:
+      - id: source_doc.en
+        kind: file
+        uri: file://readme.en.md
+        media_type: text/markdown
+defaults:
+  policy: trust_limited

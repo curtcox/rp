@@ -34,7 +34,7 @@ Attributes:
 | attr     | values                | meaning                                                        |
 | -------- | --------------------- | -------------------------------------------------------------- |
 | `id`     | unique slug           | subtest name; must be unique across all docs                   |
-| `cwd`    | `empty` \| `fixture` \| `repro` | fresh temp dir, a sandboxed copy of `example-project`, or a sandboxed copy of `reproducible-build` |
+| `cwd`    | `empty` \| `fixture` \| `repro` \| `conform` \| `translate` \| `gate` \| `flaky` | fresh temp dir, a sandboxed copy of `example-project` (git-init), `reproducible-build`, `data-conform`, `translate-doc`, `release-gate`, or `flaky-fix` |
 | `status` | `ready` \| `todo`     | `ready` is executed and asserted; `todo` is a counted placeholder |
 | `exit`   | integer (default `0`) | expected exit code of the **last** command in the block        |
 

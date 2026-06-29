@@ -1,0 +1,83 @@
+version: rp.dev/v0.1
+capabilities:
+  normalize_rows:
+    purpose: derive
+    kind: command
+    inputs:
+      dataset:
+        type: Dataset
+      schema:
+        type: SchemaSpec
+    outputs:
+      cleaned_dataset:
+        type: CleanedDataset
+        realization:
+          kind: file
+          media_type: text/csv
+        assertions:
+          - subject: cleaned_dataset
+            predicate: normalized
+            confidence: observed
+            when:
+              exit_code: 0
+            evidence_source: process_exit
+    command:
+      cwd: "."
+      argv:
+        - ./scripts/normalize_rows.sh
+      stdout:
+        save_as:
+          resource: cleaned_dataset
+          artifact_path: artifacts/cleaned.csv
+          media_type: text/csv
+    always_record_result: true
+    effects:
+      external: local_process
+      filesystem:
+        writes:
+          - ".rp/runs/${run.id}/artifacts/cleaned.csv"
+    nondeterminism: []
+    idempotence: idempotent
+    cost:
+      time: cheap
+      money_usd: 0
+      risk: low
+      human_attention: none
+  validate_schema:
+    purpose: observe
+    kind: command
+    inputs:
+      cleaned_dataset:
+        type: CleanedDataset
+      schema:
+        type: SchemaSpec
+    outputs:
+      validation_result:
+        type: CommandResult
+        assertions:
+          - subject: cleaned_dataset
+            predicate: conforms_to_schema
+            confidence: observed
+            when:
+              exit_code: 0
+            evidence_source: command_result
+    command:
+      cwd: "."
+      argv:
+        - ./scripts/validate_schema.sh
+        - "${inputs.cleaned_dataset.path}"
+      stdout:
+        save_as_artifact: validation.stdout
+        media_type: text/plain
+    always_record_result: true
+    effects:
+      external: local_process
+      filesystem:
+        writes: []
+    nondeterminism: []
+    idempotence: idempotent
+    cost:
+      time: cheap
+      money_usd: 0
+      risk: low
+      human_attention: none

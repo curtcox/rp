@@ -1,0 +1,9 @@
+columns:
+  - name: id
+    type: integer
+  - name: name
+    type: string
+    normalize: lowercase
+  - name: value
+    type: float
+row_count: 3
