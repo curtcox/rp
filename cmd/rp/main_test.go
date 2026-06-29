@@ -70,6 +70,64 @@ func TestBuildPlanBugfixOrdering(t *testing.T) {
 	}
 }
 
+func TestBuildPlanGeneralizesBeyondBugfix(t *testing.T) {
+	// A non-bugfix goal: produce a build artifact, require it to be reproduced,
+	// and require a human attestation that no capability can satisfy. The planner
+	// must plan the producing capability (not just the asserting one), order the
+	// producer before its consumer, and add no step for the manual attestation.
+	cfg := Config{
+		Resources: map[string]Resource{
+			"source": {Type: "SourceTree"},
+		},
+		Capabilities: map[string]Capability{
+			"verify_reproducible": {
+				Purpose: "observe",
+				Inputs: map[string]InputSpec{
+					"source": {Type: "SourceTree"},
+					"binary": {Type: "BuildArtifact"},
+				},
+				Outputs: map[string]OutputSpec{"check": {Assertions: []AssertionSpec{
+					{Subject: "binary", Predicate: "build_reproducible"},
+				}}},
+			},
+			"build_artifact": {
+				Purpose: "derive",
+				Inputs:  map[string]InputSpec{"source": {Type: "SourceTree"}},
+				Outputs: map[string]OutputSpec{"binary": {Assertions: []AssertionSpec{
+					{Subject: "binary", Predicate: "built"},
+				}}},
+			},
+		},
+		Goals: map[string]Goal{
+			"reproducible_release": {
+				Given:   map[string]string{"source": "source"},
+				Produce: map[string]OutputSpec{"binary": {}},
+				RequiresEvidence: []Requirement{
+					{Subject: "binary", Predicate: "build_reproducible", MinConfidence: "reproduced"},
+					{Subject: "binary", Predicate: "release_approved", MinConfidence: "attested"},
+				},
+			},
+		},
+	}
+	plan, err := buildPlan(cfg, "reproducible_release")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"build_artifact", "verify_reproducible"}
+	if len(plan) != len(want) {
+		t.Fatalf("expected %d steps, got %d: %+v", len(want), len(plan), plan)
+	}
+	for i, name := range want {
+		if plan[i].Capability != name {
+			t.Fatalf("step %d: expected %s, got %s", i+1, name, plan[i].Capability)
+		}
+	}
+	// verify_reproducible must know its binary input is the produced resource.
+	if got := plan[1].Inputs["binary"]; got != "binary" {
+		t.Fatalf("verify_reproducible binary input = %q, want %q", got, "binary")
+	}
+}
+
 func TestMergePoliciesMostRestrictive(t *testing.T) {
 	project := Policy{Permissions: map[string]interface{}{
 		"network":     map[string]interface{}{"access": "allowed"},
@@ -500,6 +558,55 @@ func TestGoalSatisfiedHonorsAllowedEvidenceSources(t *testing.T) {
 	goal.RequiresEvidence[0].AnySourceType = []string{"llm_claim"}
 	if !goalSatisfied(runDir, goal, Config{}) {
 		t.Fatal("matching source should satisfy requirement")
+	}
+}
+
+func TestEvidenceAggregatesAcrossRuns(t *testing.T) {
+	// Evidence accumulated in separate runs (e.g. an achieve run plus a later
+	// attest run) must combine to satisfy a goal.
+	dir := t.TempDir()
+	oldwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := os.Chdir(oldwd); err != nil {
+			t.Fatal(err)
+		}
+	}()
+	mkRun := func(id, events string) {
+		runDir := filepath.Join(dir, ".rp", "runs", id)
+		if err := os.MkdirAll(runDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(runDir, "events.jsonl"), []byte(events), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mkRun("run-20260101T000000.000000000Z",
+		`{"type":"assertion_recorded","data":{"id":"as-1","subject":"binary","predicate":"build_reproducible","confidence":"reproduced","evidence_id":"ev-1","evidence_source":"command_result","action_id":"act-1"}}`+"\n")
+	mkRun("run-20260102T000000.000000000Z",
+		`{"type":"assertion_recorded","data":{"id":"as-2","subject":"binary","predicate":"release_approved","confidence":"attested","evidence_id":"ev-2","evidence_source":"human_review","action_id":"act-2"}}`+"\n")
+	if err := os.WriteFile(filepath.Join(dir, ".rp", "planner.yaml"), []byte("version: rp.dev/v0.1\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	goal := Goal{RequiresEvidence: []Requirement{
+		{Subject: "binary", Predicate: "build_reproducible", MinConfidence: "reproduced"},
+		{Subject: "binary", Predicate: "release_approved", MinConfidence: "attested"},
+	}}
+	if missing := missingEvidenceAcross(goal, Config{}); len(missing) != 0 {
+		t.Fatalf("expected no missing evidence across runs, got %+v", missing)
+	}
+	// A single run only carries half the evidence.
+	latest, err := latestRunDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if missing := missingEvidenceWithConfig(latest, goal, Config{}); len(missing) != 1 {
+		t.Fatalf("expected one requirement missing within a single run, got %+v", missing)
 	}
 }
 

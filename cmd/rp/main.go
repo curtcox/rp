@@ -648,35 +648,36 @@ func cmdEvidence(args []string) error {
 	if !ok {
 		return fmt.Errorf("goal %q not found", goalName)
 	}
-	runDir, err := latestRunDir()
-	if err != nil {
+	if _, err := latestRunDir(); err != nil {
 		return err
 	}
-	summary := loadRunSummary(runDir)
-	if g, _ := summary["goal"].(string); g != "" && g != goalName {
-		fmt.Printf("note: latest run goal is %q, not %q\n", g, goalName)
+	anchor, ok := latestRunDirForGoal(goalName)
+	if !ok {
+		anchor, _ = latestRunDir()
 	}
-	satisfied := goalSatisfied(runDir, goal, cfg)
-	fmt.Printf("Goal %s (run %s)\n", goalName, filepath.Base(runDir))
+	missing := missingEvidenceAcross(goal, cfg)
+	produceGaps := missingProduceAcross(goal)
+	satisfied := len(missing) == 0 && len(produceGaps) == 0
+	fmt.Printf("Goal %s (run %s)\n", goalName, filepath.Base(anchor))
 	fmt.Printf("Satisfied: %v\n\n", satisfied)
 	if len(goal.Produce) > 0 {
 		fmt.Println("Required outputs:")
-		realizations := realizationsFromRun(runDir)
+		realizations, _ := realizationsAcrossRuns()
 		for _, name := range sortedKeys(goal.Produce) {
 			spec := goal.Produce[name]
 			status := "missing"
 			detail := ""
-			if rec, ok := realizations[name]; ok {
-				if reason := produceSpecMismatch(runDir, spec, rec); reason == "" {
+			if lr, ok := realizations[name]; ok {
+				if reason := produceSpecMismatch(lr.runDir, spec, lr.rec); reason == "" {
 					status = "ok"
-					if rec.MediaType != "" {
-						detail = rec.MediaType
+					if lr.rec.MediaType != "" {
+						detail = lr.rec.MediaType
 					}
-					if rec.Artifact != "" {
+					if lr.rec.Artifact != "" {
 						if detail != "" {
 							detail += " at "
 						}
-						detail += rec.Artifact
+						detail += lr.rec.Artifact
 					}
 				} else {
 					status = "mismatch"
@@ -692,16 +693,13 @@ func cmdEvidence(args []string) error {
 		fmt.Println()
 	}
 	fmt.Println("Required evidence:")
-	assertions, _ := assertionsFromRun(runDir)
+	assertions, _ := assertionsAcrossRuns()
 	effective := effectiveAssertions(assertions)
 	for _, req := range goal.RequiresEvidence {
 		status := "missing"
 		detail := ""
 		for _, as := range effective {
-			if as.Subject == req.Subject && as.Predicate == req.Predicate &&
-				model.ConfidenceAtLeast(as.Confidence, req.MinConfidence) &&
-				sourceAllowed(as.EvidenceSource, req.AnySourceType) &&
-				sourceMaySatisfyRequiredEvidence(cfg, as.EvidenceSource) {
+			if assertionSatisfiesReq(as, req, cfg) {
 				status = "ok"
 				detail = fmt.Sprintf("%s via %s (%s)", as.Confidence, as.EvidenceSource, as.ID)
 				break
@@ -713,7 +711,6 @@ func cmdEvidence(args []string) error {
 		}
 		fmt.Println()
 	}
-	missing := missingEvidenceWithConfig(runDir, goal, cfg)
 	if len(missing) > 0 {
 		fmt.Printf("\nMissing requirements: %d\n", len(missing))
 	}
@@ -728,11 +725,10 @@ func cmdWhy(args []string) error {
 	if !ok {
 		return errors.New("why expects SUBJECT.PREDICATE")
 	}
-	runDir, err := latestRunDir()
-	if err != nil {
+	if _, err := latestRunDir(); err != nil {
 		return err
 	}
-	assertions, err := assertionsFromRun(runDir)
+	assertions, err := assertionsAcrossRuns()
 	if err != nil {
 		return err
 	}
@@ -743,7 +739,7 @@ func cmdWhy(args []string) error {
 		}
 	}
 	if best.ID == "" {
-		fmt.Printf("%s.%s is unsupported in latest run %s\n", subject, predicate, filepath.Base(runDir))
+		fmt.Printf("%s.%s is unsupported\n", subject, predicate)
 		return nil
 	}
 	fmt.Printf("%s.%s is %s\nsupported by assertion %s from action %s and evidence %s (%s)\n", subject, predicate, best.Confidence, best.ID, best.ActionID, best.EvidenceID, best.EvidenceSource)
@@ -1798,9 +1794,9 @@ func buildPlan(cfg Config, goalName string) ([]PlanStep, error) {
 			}
 		}
 	}
-	if _, wantsPatch := goal.Produce["patch"]; wantsPatch {
-		if capName := findOutputCapability(cfg, "patch"); capName != "" {
-			add(capName, "produce patch resource", map[string]string{"repo": repoName, "bug_report": bugName})
+	for _, resName := range sortedKeys(goal.Produce) {
+		if capName := findOutputCapability(cfg, resName); capName != "" {
+			add(capName, "produce "+resName+" resource", planInputs(cfg, goal, cfg.Capabilities[capName], repoName, bugName))
 		}
 	}
 	for _, req := range goal.RequiresEvidence {
@@ -1823,8 +1819,17 @@ func buildPlan(cfg Config, goalName string) ([]PlanStep, error) {
 				add(capName, "observe "+req.Subject+"."+req.Predicate, map[string]string{"repo": subject})
 			}
 		default:
+			// Generic backward chaining for any other subject/predicate: if the
+			// subject is a resource that some capability derives (and is not a
+			// declared root resource), plan that derivation first, then the
+			// capability that asserts the required predicate.
+			if _, isResource := cfg.Resources[req.Subject]; !isResource {
+				if capName := findOutputCapability(cfg, req.Subject); capName != "" {
+					add(capName, "derive "+req.Subject, planInputs(cfg, goal, cfg.Capabilities[capName], repoName, bugName))
+				}
+			}
 			if capName := findAssertionCapability(cfg, req.Subject, req.Predicate); capName != "" {
-				add(capName, "observe "+req.Subject+"."+req.Predicate, map[string]string{req.Subject: req.Subject})
+				add(capName, "observe "+req.Subject+"."+req.Predicate, planInputs(cfg, goal, cfg.Capabilities[capName], repoName, bugName))
 			}
 		}
 	}
@@ -1847,17 +1852,150 @@ func buildPlan(cfg Config, goalName string) ([]PlanStep, error) {
 	if err := validatePlanMaxCost(cfg, goal, steps); err != nil {
 		return nil, err
 	}
-	sort.Slice(steps, func(i, j int) bool {
+	steps = orderPlanSteps(cfg, steps)
+	for i := range steps {
+		steps[i].ID = fmt.Sprintf("step-%02d", i+1)
+	}
+	return steps, nil
+}
+
+// planInputs resolves each input of a capability to a concrete resource name so
+// the planned step knows what it operates on.
+func planInputs(cfg Config, goal Goal, cap Capability, repoName, bugName string) map[string]string {
+	inputs := map[string]string{}
+	for inName, in := range cap.Inputs {
+		inputs[inName] = resolveInputResource(cfg, goal, inName, in, repoName, bugName)
+	}
+	return inputs
+}
+
+// resolveInputResource maps a capability input to a resource: a goal "given"
+// binding, a declared or produced resource of the same name, the first resource
+// of the input's type, or — failing all of those — the input name itself.
+func resolveInputResource(cfg Config, goal Goal, inName string, in InputSpec, repoName, bugName string) string {
+	if res := goal.Given[inName]; res != "" {
+		return res
+	}
+	if _, ok := cfg.Resources[inName]; ok {
+		return inName
+	}
+	if findOutputCapability(cfg, inName) != "" {
+		return inName
+	}
+	if _, ok := goal.Produce[inName]; ok {
+		return inName
+	}
+	if in.Type != "" {
+		if r := firstResourceOfType(cfg, in.Type); r != "" {
+			return r
+		}
+	}
+	switch inName {
+	case "repo":
+		if repoName != "" {
+			return repoName
+		}
+	case "bug_report":
+		if bugName != "" {
+			return bugName
+		}
+	}
+	return inName
+}
+
+// orderPlanSteps performs a stable topological sort of the collected steps so a
+// capability that produces a resource (or asserts a precondition predicate)
+// always runs before the one that consumes it. Ties are broken by
+// planStepPriority then capability name, which keeps the bugfix plan's ordering
+// identical while generalising to arbitrary goals.
+func orderPlanSteps(cfg Config, steps []PlanStep) []PlanStep {
+	n := len(steps)
+	if n <= 1 {
+		return steps
+	}
+	producesRes := make([]map[string]bool, n)
+	producesPred := make([]map[string]bool, n)
+	consumesRes := make([]map[string]bool, n)
+	requiresPred := make([]map[string]bool, n)
+	for i, s := range steps {
+		cap := cfg.Capabilities[s.Capability]
+		pr := map[string]bool{}
+		pp := map[string]bool{}
+		for outName, out := range cap.Outputs {
+			pr[outName] = true
+			for _, as := range out.Assertions {
+				pp[as.Predicate] = true
+			}
+		}
+		cr := map[string]bool{}
+		for _, res := range s.Inputs {
+			cr[res] = true
+		}
+		rp := map[string]bool{}
+		for _, in := range cap.Inputs {
+			for _, req := range in.Requires {
+				rp[req.Predicate] = true
+			}
+		}
+		producesRes[i], producesPred[i], consumesRes[i], requiresPred[i] = pr, pp, cr, rp
+	}
+	indeg := make([]int, n)
+	edges := make([][]int, n)
+	for a := 0; a < n; a++ {
+		for b := 0; b < n; b++ {
+			if a == b {
+				continue
+			}
+			dep := false
+			for res := range consumesRes[b] {
+				if producesRes[a][res] {
+					dep = true
+				}
+			}
+			for pred := range requiresPred[b] {
+				if producesPred[a][pred] {
+					dep = true
+				}
+			}
+			if dep {
+				edges[a] = append(edges[a], b)
+				indeg[b]++
+			}
+		}
+	}
+	less := func(i, j int) bool {
 		pi, pj := planStepPriority(cfg, steps[i]), planStepPriority(cfg, steps[j])
 		if pi != pj {
 			return pi < pj
 		}
 		return steps[i].Capability < steps[j].Capability
-	})
-	for i := range steps {
-		steps[i].ID = fmt.Sprintf("step-%02d", i+1)
 	}
-	return steps, nil
+	done := make([]bool, n)
+	ordered := make([]PlanStep, 0, n)
+	for len(ordered) < n {
+		next := -1
+		for i := 0; i < n; i++ {
+			if done[i] || indeg[i] != 0 {
+				continue
+			}
+			if next == -1 || less(i, next) {
+				next = i
+			}
+		}
+		if next == -1 { // dependency cycle: make progress deterministically
+			for i := 0; i < n; i++ {
+				if !done[i] && (next == -1 || less(i, next)) {
+					next = i
+				}
+			}
+		}
+		done[next] = true
+		ordered = append(ordered, steps[next])
+		for _, b := range edges[next] {
+			indeg[b]--
+		}
+	}
+	return ordered
 }
 
 func planStepPriority(cfg Config, step PlanStep) int {
@@ -2306,6 +2444,139 @@ func missingEvidence(runDir string, goal Goal) []Requirement {
 	return missingEvidenceWithConfig(runDir, goal, Config{})
 }
 
+// assertionSatisfiesReq reports whether a recorded assertion meets a goal's
+// evidence requirement: matching subject/predicate, confidence at or above the
+// minimum, an allowed evidence source, and a source that policy permits to
+// satisfy required evidence.
+func assertionSatisfiesReq(as AssertionRecord, req Requirement, cfg Config) bool {
+	return as.Subject == req.Subject && as.Predicate == req.Predicate &&
+		model.ConfidenceAtLeast(as.Confidence, req.MinConfidence) &&
+		sourceAllowed(as.EvidenceSource, req.AnySourceType) &&
+		sourceMaySatisfyRequiredEvidence(cfg, as.EvidenceSource)
+}
+
+// allRunDirs returns every run directory for the project, sorted chronologically
+// (run ids are timestamps, so lexical order is chronological).
+func allRunDirs() ([]string, error) {
+	root, err := findProjectRoot()
+	if err != nil {
+		return nil, err
+	}
+	matches, err := filepath.Glob(filepath.Join(root, ".rp", "runs", "run-*"))
+	if err != nil {
+		return nil, err
+	}
+	sort.Strings(matches)
+	return matches, nil
+}
+
+// assertionsAcrossRuns collects assertions from every run. Evidence is an
+// append-only project-wide store: a goal can be satisfied by evidence
+// accumulated across several runs (e.g. an `achieve` run plus a later `attest`).
+func assertionsAcrossRuns() ([]AssertionRecord, error) {
+	dirs, err := allRunDirs()
+	if err != nil {
+		return nil, err
+	}
+	var all []AssertionRecord
+	for _, d := range dirs {
+		as, err := assertionsFromRun(d)
+		if err != nil {
+			continue
+		}
+		all = append(all, as...)
+	}
+	return all, nil
+}
+
+// locatedRealization records which run produced a resource realization so its
+// artifact file can be located when validating produce requirements.
+type locatedRealization struct {
+	rec    ProduceRecord
+	runDir string
+}
+
+// realizationsAcrossRuns merges resource realizations from every run; a later
+// run's realization of the same resource overrides an earlier one.
+func realizationsAcrossRuns() (map[string]locatedRealization, error) {
+	dirs, err := allRunDirs()
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]locatedRealization{}
+	for _, d := range dirs {
+		for name, rec := range realizationsFromRun(d) {
+			out[name] = locatedRealization{rec: rec, runDir: d}
+		}
+	}
+	return out, nil
+}
+
+// missingEvidenceAcross evaluates a goal's evidence requirements against the
+// project-wide assertion store rather than a single run.
+func missingEvidenceAcross(goal Goal, cfg Config) []Requirement {
+	assertions, err := assertionsAcrossRuns()
+	if err != nil {
+		return goal.RequiresEvidence
+	}
+	effective := effectiveAssertions(assertions)
+	var missing []Requirement
+	for _, req := range goal.RequiresEvidence {
+		ok := false
+		for _, as := range effective {
+			if assertionSatisfiesReq(as, req, cfg) {
+				ok = true
+				break
+			}
+		}
+		if !ok {
+			missing = append(missing, req)
+		}
+	}
+	return missing
+}
+
+// missingProduceAcross checks a goal's produce requirements against realizations
+// from every run.
+func missingProduceAcross(goal Goal) []string {
+	if len(goal.Produce) == 0 {
+		return nil
+	}
+	reals, err := realizationsAcrossRuns()
+	if err != nil {
+		return nil
+	}
+	var gaps []string
+	for _, name := range sortedKeys(goal.Produce) {
+		spec := goal.Produce[name]
+		lr, ok := reals[name]
+		if !ok {
+			gaps = append(gaps, name+": not produced")
+			continue
+		}
+		if reason := produceSpecMismatch(lr.runDir, spec, lr.rec); reason != "" {
+			gaps = append(gaps, name+": "+reason)
+		}
+	}
+	return gaps
+}
+
+// latestRunDirForGoal finds the most recent run whose summary names goalName, so
+// evidence output can anchor its header on the relevant run rather than an
+// unrelated manual-assertion run.
+func latestRunDirForGoal(goalName string) (string, bool) {
+	dirs, err := allRunDirs()
+	if err != nil {
+		return "", false
+	}
+	for i := len(dirs) - 1; i >= 0; i-- {
+		if g, _ := loadRunSummary(dirs[i])["goal"].(string); g == goalName {
+			return dirs[i], true
+		}
+	}
+	return "", false
+}
+
 func missingEvidenceWithConfig(runDir string, goal Goal, cfg Config) []Requirement {
 	assertions, err := assertionsFromRun(runDir)
 	if err != nil {
@@ -2316,7 +2587,7 @@ func missingEvidenceWithConfig(runDir string, goal Goal, cfg Config) []Requireme
 	for _, req := range goal.RequiresEvidence {
 		ok := false
 		for _, as := range effective {
-			if as.Subject == req.Subject && as.Predicate == req.Predicate && model.ConfidenceAtLeast(as.Confidence, req.MinConfidence) && sourceAllowed(as.EvidenceSource, req.AnySourceType) && sourceMaySatisfyRequiredEvidence(cfg, as.EvidenceSource) {
+			if assertionSatisfiesReq(as, req, cfg) {
 				ok = true
 			}
 		}

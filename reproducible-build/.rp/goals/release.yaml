@@ -1,0 +1,38 @@
+version: rp.dev/v0.1
+goals:
+  reproducible_release:
+    description: >-
+      Build the project reproducibly and require a human release sign-off before
+      the artifact is considered releasable.
+    given:
+      source: source
+    produce:
+      binary:
+        type: BuildArtifact
+        required_realization:
+          kind: file
+          media_type: application/octet-stream
+    requires_evidence:
+      # The system must reproduce the build itself: two independent builds whose
+      # artifacts hash identically. This is stronger than `observed` — it is the
+      # `reproduced` rung of the confidence ladder.
+      - subject: binary
+        predicate: build_reproducible
+        min_confidence: reproduced
+        any_source_type:
+          - command_result
+          - process_exit
+      # A human must vouch for the release. No automatic capability can satisfy
+      # this; it is met only by `rp attest binary.release_approved`.
+      - subject: binary
+        predicate: release_approved
+        min_confidence: attested
+        any_source_type:
+          - human_review
+    constraints:
+      permissions:
+        network: forbidden
+        credentials: forbidden
+      max_cost:
+        time: 10m
+        money_usd: 0

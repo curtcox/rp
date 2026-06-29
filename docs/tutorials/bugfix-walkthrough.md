@@ -109,5 +109,7 @@ $ rp replay run-20260628T213615.913017000Z
 
 ## Next
 
+- [Reproducible build](reproducible-build.md) — climb past `observed` to
+  `reproduced` and `attested`.
 - [Writing a capability](writing-a-capability.md)
 - [Defining a goal](defining-a-goal.md)

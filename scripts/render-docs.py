@@ -54,6 +54,7 @@ NAV = [
     ]),
     ("Tutorials", [
         ("tutorials/bugfix-walkthrough.md", "Bugfix walkthrough"),
+        ("tutorials/reproducible-build.md", "Reproducible build"),
         ("tutorials/writing-a-capability.md", "Writing a capability"),
         ("tutorials/defining-a-goal.md", "Defining a goal"),
     ]),

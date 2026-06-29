@@ -22,8 +22,9 @@ import (
 //
 // Attributes:
 //   - id      unique identifier (used as the subtest name)
-//   - cwd     "empty" (fresh temp dir) or "fixture" (a sandboxed copy of
-//             example-project, git-initialised); defaults to "empty"
+//   - cwd     "empty" (fresh temp dir), "fixture" (a sandboxed copy of
+//             example-project, git-initialised), or "repro" (a sandboxed copy of
+//             the reproducible-build fixture); defaults to "empty"
 //   - status  "ready" (executed and asserted) or "todo" (a placeholder that is
 //             counted and skipped); defaults to "ready"
 //   - exit    expected exit code of the LAST command in the block (default 0)
@@ -329,8 +330,14 @@ func exampleSandbox(t *testing.T, cwd string) string {
 		}
 		copyDir(t, exampleRoot, dir)
 		gitInitFixture(t, dir)
+	case "repro":
+		exampleRoot := filepath.Join("..", "..", "reproducible-build")
+		if _, err := os.Stat(filepath.Join(exampleRoot, ".rp", "planner.yaml")); err != nil {
+			t.Skip("reproducible-build fixture not present")
+		}
+		copyDir(t, exampleRoot, dir)
 	default:
-		t.Fatalf("unknown cwd %q (want empty|fixture)", cwd)
+		t.Fatalf("unknown cwd %q (want empty|fixture|repro)", cwd)
 	}
 	return dir
 }

@@ -1,0 +1,15 @@
+version: rp.dev/v0.1
+imports:
+  - capabilities/build.yaml
+  - policies/release-safe.yaml
+  - goals/release.yaml
+resources:
+  source:
+    type: SourceTree
+    realizations:
+      - id: source.local
+        kind: local_path
+        uri: file://src
+        media_type: inode/directory
+defaults:
+  policy: release_safe

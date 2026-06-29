@@ -1,0 +1,82 @@
+version: rp.dev/v0.1
+capabilities:
+  build_artifact:
+    purpose: derive
+    kind: command
+    inputs:
+      source:
+        type: SourceTree
+    outputs:
+      binary:
+        type: BuildArtifact
+        realization:
+          kind: file
+          media_type: application/octet-stream
+        assertions:
+          - subject: binary
+            predicate: built
+            confidence: observed
+            when:
+              exit_code: 0
+            evidence_source: process_exit
+    command:
+      cwd: "."
+      argv:
+        - ./scripts/build.sh
+      stdout:
+        save_as:
+          resource: binary
+          artifact_path: artifacts/app.bundle
+          media_type: application/octet-stream
+    always_record_result: true
+    effects:
+      external: local_process
+      filesystem:
+        writes:
+          - ".rp/runs/${run.id}/artifacts/app.bundle"
+    # The build is deterministic by construction — that is the whole point.
+    nondeterminism: []
+    idempotence: idempotent
+    cost:
+      time: cheap
+      money_usd: 0
+      risk: low
+      human_attention: none
+  verify_reproducible:
+    purpose: observe
+    kind: command
+    inputs:
+      source:
+        type: SourceTree
+      binary:
+        type: BuildArtifact
+    outputs:
+      reproducibility_check:
+        type: CommandResult
+        assertions:
+          - subject: binary
+            predicate: build_reproducible
+            confidence: reproduced
+            when:
+              exit_code: 0
+            evidence_source: command_result
+    command:
+      cwd: "."
+      argv:
+        - ./scripts/compare_builds.sh
+      stdout:
+        save_as_artifact: reproducibility.stdout
+        media_type: text/plain
+    always_record_result: true
+    effects:
+      external: local_process
+      filesystem:
+        writes: []
+    nondeterminism:
+      - external_process
+    idempotence: idempotent
+    cost:
+      time: moderate
+      money_usd: 0
+      risk: low
+      human_attention: none
