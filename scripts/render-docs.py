@@ -41,6 +41,13 @@ NAV = [
         ("concepts/overview.md", "The model"),
         ("concepts/glossary.md", "Glossary"),
     ]),
+    ("Under the hood", [
+        ("internals/index.md", "How rp works"),
+        ("internals/planning.md", "Backward planning"),
+        ("internals/execution.md", "Execution & JIT re-planning"),
+        ("internals/evidence.md", "Evidence & confidence"),
+        ("internals/hashing-and-policy.md", "Hashing, policy & budgets"),
+    ]),
     ("Config", [
         ("config/reference.md", ".rp/ reference"),
         ("config/policy.md", "Policy"),

@@ -36,6 +36,8 @@ See [Concepts](concepts/overview.md) and the [Glossary](concepts/glossary.md).
 - **[CLI reference](cli/index.md)** — every command, flag by flag.
 - **[Config reference](config/reference.md)** — the `.rp/` YAML schema.
 - **[Tutorials](tutorials/bugfix-walkthrough.md)** — end-to-end walkthroughs.
+- **[Under the hood](internals/index.md)** — the planning, execution, and
+  evidence algorithms, and how to use them well.
 
 The test, coverage, lint, and complexity dashboards live under
 [Reports](../index.html).

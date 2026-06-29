@@ -40,3 +40,5 @@ policy forbids are filtered out of the plan. See
 - [Glossary](glossary.md) — precise definitions and the confidence ladder.
 - [Config reference](../config/reference.md) — how the model is written in YAML.
 - [Tutorials](../tutorials/bugfix-walkthrough.md) — the model in action.
+- [Under the hood](../internals/index.md) — the algorithms that plan, execute,
+  and evaluate evidence.

@@ -8,6 +8,8 @@ the test and static-analysis dashboards.
 - `getting-started.md` — install, build, and the core loop.
 - `cli/` — one page per command.
 - `concepts/` — the model and the glossary.
+- `internals/` — under-the-hood algorithms (planning, execution, evidence,
+  hashing/policy) and how to use them well.
 - `config/` — the `.rp/` YAML reference and policy semantics.
 - `tutorials/` — end-to-end walkthroughs.
 
