@@ -36,6 +36,17 @@ See [Concepts](concepts/overview.md) and the [Glossary](concepts/glossary.md).
 - **[CLI reference](cli/index.md)** — every command, flag by flag.
 - **[Config reference](config/reference.md)** — the `.rp/` YAML schema.
 - **[Tutorials](tutorials/bugfix-walkthrough.md)** — end-to-end walkthroughs.
+  - Today: [bugfix](tutorials/bugfix-walkthrough.md),
+    [data conform](tutorials/data-conform.md),
+    [translation](tutorials/translate-doc.md),
+    [release gate](tutorials/release-gate.md),
+    [flaky fix](tutorials/flaky-fix.md),
+    [reproducible build](tutorials/reproducible-build.md).
+  - Planned (examples only, not yet implemented):
+    [solver chooses cheapest plan](tutorials/solver-backed-release.md),
+    [signed goal attestation](tutorials/signed-attestation.md),
+    [structural schema validation](tutorials/schema-checked-resources.md),
+    [durable polling goals](tutorials/durable-polling.md).
 - **[Under the hood](internals/index.md)** — the planning, execution, and
   evidence algorithms, and how to use them well.
 

@@ -12,6 +12,13 @@ the test and static-analysis dashboards.
   hashing/policy) and how to use them well.
 - `config/` — the `.rp/` YAML reference and policy semantics.
 - `tutorials/` — end-to-end walkthroughs.
+  - **Implemented** — bugfix, data conform, translation, release gate, flaky fix,
+    reproducible build.
+  - **Future (`status=todo`)** — [solver-backed release](tutorials/solver-backed-release.md),
+    [signed attestation](tutorials/signed-attestation.md),
+    [schema-checked resources](tutorials/schema-checked-resources.md),
+    [durable polling](tutorials/durable-polling.md). These document proposed
+    capabilities; console examples are placeholders until the features land.
 
 ## Runnable examples (the doctest convention)
 
