@@ -1389,7 +1389,7 @@ func loadConfig(path string) (Config, error) {
 		return Config{}, err
 	}
 	root := filepath.Dir(path)
-	merged := base
+	merged := Config{Version: base.Version, Imports: append([]string(nil), base.Imports...)}
 	merged.Capabilities = map[string]Capability{}
 	merged.Policies = map[string]Policy{}
 	merged.Goals = map[string]Goal{}

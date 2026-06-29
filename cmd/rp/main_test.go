@@ -283,6 +283,67 @@ func TestMergePoliciesMostRestrictive(t *testing.T) {
 	}
 }
 
+func TestLoadConfigMergesLocalImportsWithBaseOverride(t *testing.T) {
+	dir := t.TempDir()
+	rpDir := filepath.Join(dir, ".rp")
+	if err := os.MkdirAll(rpDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	imported := []byte(`version: rp.dev/v0.1
+resources:
+  repo:
+    type: ImportedRepo
+  bug_report:
+    type: BugReport
+capabilities:
+  imported_cap:
+    purpose: observe
+    kind: command
+goals:
+  imported_goal:
+    requires_evidence: []
+defaults:
+  policy: imported
+`)
+	if err := os.WriteFile(filepath.Join(rpDir, "capabilities.yaml"), imported, 0644); err != nil {
+		t.Fatal(err)
+	}
+	base := []byte(`version: rp.dev/v0.1
+imports:
+  - capabilities.yaml
+resources:
+  repo:
+    type: ProjectRepo
+policies:
+  local_safe:
+    permissions: {}
+defaults:
+  policy: local_safe
+`)
+	if err := os.WriteFile(filepath.Join(rpDir, "planner.yaml"), base, 0644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := loadConfig(filepath.Join(rpDir, "planner.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Resources["bug_report"].Type != "BugReport" {
+		t.Fatalf("imported resource missing: %+v", cfg.Resources)
+	}
+	if cfg.Capabilities["imported_cap"].Kind != "command" {
+		t.Fatalf("imported capability missing: %+v", cfg.Capabilities)
+	}
+	if _, ok := cfg.Goals["imported_goal"]; !ok {
+		t.Fatalf("imported goal missing: %+v", cfg.Goals)
+	}
+	if cfg.Resources["repo"].Type != "ProjectRepo" {
+		t.Fatalf("base planner should override imported resource, got %+v", cfg.Resources["repo"])
+	}
+	if cfg.Defaults["policy"] != "local_safe" {
+		t.Fatalf("base planner should override imported defaults, got %+v", cfg.Defaults)
+	}
+}
+
 func TestExampleProjectBugfixAchieve(t *testing.T) {
 	exampleRoot := filepath.Join("..", "..", "example-project")
 	if _, err := os.Stat(filepath.Join(exampleRoot, ".rp", "planner.yaml")); err != nil {
@@ -1175,6 +1236,87 @@ defaults:
 	}
 	if !foundObservation {
 		t.Fatal("expected observation even on failure with always_record_result")
+	}
+}
+
+func TestCommandReceivesOnlyAllowedEnvironment(t *testing.T) {
+	dir := t.TempDir()
+	oldwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := os.Chdir(oldwd); err != nil {
+			t.Fatal(err)
+		}
+	}()
+	t.Setenv("RP_SECRET_TOKEN", "top-secret")
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(".rp/runs", 0755); err != nil {
+		t.Fatal(err)
+	}
+	planner := []byte(`version: rp.dev/v0.1
+capabilities:
+  show_env:
+    purpose: observe
+    kind: command
+    inputs: {}
+    outputs:
+      result:
+        type: CommandResult
+        assertions:
+          - subject: env
+            predicate: captured
+            confidence: observed
+            when:
+              exit_code: 0
+    command:
+      cwd: "."
+      argv: [/bin/sh, -c, 'printf "PATH=%s\nRP_SECRET_TOKEN=%s\n" "$PATH" "$RP_SECRET_TOKEN"']
+      stdout:
+        save_as_artifact: env.txt
+    effects:
+      external: local_process
+      filesystem:
+        writes: []
+goals:
+  smoke:
+    requires_evidence:
+      - subject: env
+        predicate: captured
+        min_confidence: observed
+policies:
+  local_safe:
+    permissions: {}
+    environment:
+      inherit: false
+      allow:
+        - PATH
+defaults:
+  policy: local_safe
+`)
+	if err := os.WriteFile(".rp/planner.yaml", planner, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"achieve", "smoke"}); err != nil {
+		t.Fatal(err)
+	}
+	runDir, err := latestRunDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	envBytes, err := os.ReadFile(filepath.Join(runDir, "artifacts", "env.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := string(envBytes)
+	if !strings.Contains(out, "PATH=") {
+		t.Fatalf("allowed PATH missing from command environment: %q", out)
+	}
+	if strings.Contains(out, "top-secret") || !strings.Contains(out, "RP_SECRET_TOKEN=\n") {
+		t.Fatalf("disallowed secret leaked into command environment: %q", out)
 	}
 }
 

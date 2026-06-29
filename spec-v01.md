@@ -1,4 +1,4 @@
-rp v0.1 Specification Draft
+rp v0.1 Specification Draft with Implementation Status
 
 1. One-page product thesis
 
@@ -202,19 +202,30 @@ rp is evidence-auditable, not truth-sound. It records why assertions are believe
 
 3. v0.1 scope
 
+Status note
+
+This document records design intent and current implementation status. The Go
+CLI in `cmd/rp/main.go` is authoritative for current behavior when it differs
+from this draft. Status labels below mean:
+
+Complete: implemented and covered by tests or runnable docs.
+Partial: implemented in a narrow vertical-slice form, or present without the
+full generality implied by the model.
+Deferred: intentionally not implemented for v0.1.
+
 In scope
 
-v0.1 supports:
+v0.1 supports the following in the current code:
 
 local CLI workflow
 project-local .rp/ directory
 YAML authoring files
-canonical JSON internal representation
-local imports only
+canonical JSON hashing of merged config
+local imports with project config overriding imported entries
 built-in primitive resource types
 command capabilities
-optional built-in observers if simpler
-simple backward-chaining planner
+built-in git_status observer
+simple backward-chaining planner with deterministic topological ordering
 provisional full plan display
 recursive just-in-time replanning
 serial execution
@@ -224,11 +235,17 @@ policy-controlled approvals
 host execution by default
 append-only JSONL event logs
 generated run summaries
-resource/evidence/provenance inspection
+resource/evidence/provenance inspection with why, trace, evidence, audit, replay
 DOT and Mermaid plan export
 manual resource/assertion/attestation entry
 user and project policy layers
 minimal canonical config hashing
+saved plan snapshots and rp exec
+cross-run evidence and realization aggregation for evidence reports
+source limits and final-goal evidence source rules
+goal attestations for satisfied runs
+simple max-cost gates and external-side-effect gates
+auto-repair retries that can insert repair capabilities on replan
 
 Out of scope for v0.1
 
@@ -269,6 +286,32 @@ shared capability packs
 richer structural schemas
 long-running orchestration
 parallel executor
+
+Current partials and caveats
+
+The current implementation deliberately keeps several concepts narrower than
+the formal model:
+
+Resource types are named strings; there is no structural type checker.
+Git has no semantic planner primitive, but `GitRepo` resources are validated as
+independent repositories before execution and Git workflows are expressed as
+command capabilities.
+Evidence records are event-log entries with source types, confidence levels,
+hashes, and assertion links, not a separate queryable database.
+Observations are normalized only for command/process exits and the git_status
+observer.
+Approval grouping is by filesystem write class, including destructive writes;
+there is no richer prompt grouping UI.
+User policy loading supports one policy from `~/.config/rp/policy.yaml`; project
+and user policies are merged most-restrictive-wins for implemented dimensions.
+Canonical config hashing covers merged config as JSON with sorted object keys;
+the hash is not a compatibility promise for future schemas.
+Cost handling is heuristic: time classes map to fixed minute estimates and only
+selected cost dimensions are enforced.
+Auto-repair means retry after failure with repair-purpose capabilities included;
+it is not an autonomous repair synthesis system.
+`always_record_result` records process observations and failed action events; it
+does not force a failed command to satisfy success assertions.
 
 ⸻
 
@@ -1045,125 +1088,205 @@ Initial storage:
 
 ⸻
 
-10. First five development milestones
+10. Development milestone status
 
 Milestone 1 — Minimal vertical slice
 
-Goal:
+Status: Complete.
 
-rp init → load YAML → plan one goal → execute one command → record evidence → explain why
+Done:
 
-Deliverables:
-
-Go CLI skeleton
-.rp/ directory creation
-YAML parser
-strict schema validation
-local imports
+Go CLI skeleton and command dispatch
+.rp/ directory creation through rp init
+YAML parser and strict schema validation, with x-* extension escape hatch
+local import merging
 simple resource/capability/goal model
-one command capability
-JSONL event log
+command capabilities
+append-only JSONL event log
 rp plan
 rp achieve
 rp why
+config hashing for merged config
 
-Success test:
+Tests and evidence:
 
-A fixture project can declare a goal requiring a CommandResult assertion,
-run a command, record process exit evidence, and explain the satisfied goal.
+TestExampleProjectBugfixAchieve
+TestPlanSavesSnapshotAndExecRunsIt
+TestStrictYAMLRejectsUnknownFields
+TestStrictYAMLAllowsExtensionFields
+TestLoadConfigMergesLocalImportsWithBaseOverride
+docs console doctests
+
+Notes:
+
+The config package described in the architecture sketch has not been split out;
+the CLI implementation remains concentrated in `cmd/rp/main.go`.
 
 ⸻
 
 Milestone 2 — Resource/evidence model
 
-Deliverables:
+Status: Complete for the v0.1 vertical slice; Partial versus the full formal
+model.
 
-Resource versus realization identity
-assertions
-observations
+Done:
+
+resource versus realization identity in the model
+assertion records
+observation events
 evidence source types
 confidence ordering
-always-record failed action results
-supersession/correction model
+policy source limits
+final-goal evidence source rules
+always-record failed action observations
+assertion supersession/correction
 artifact recording under .rp/runs
+produced-resource realization checks
+cross-run evidence and realization aggregation
+goal attestation events for satisfied runs
+manual assertion and attestation commands
 
-Success test:
+Partial:
 
-A failed test command creates a TestResult resource and evidence record,
-then rp why explains that the goal is not satisfied because tests_pass is unsupported or failed.
+Evidence, Observation, and Attestation are represented as JSONL events rather
+than standalone typed records in a query store.
+Observation normalization is limited to command/process results and git_status.
+Signed attestations are deferred.
+
+Tests and evidence:
+
+TestFailedActionEmitsActionFailedEvent
+TestAssertionSupersessionKeepsLatestEffective
+TestPolicySourceLimitsCapConfidence
+TestMissingEvidenceHonorsFinalGoalSourceRules
+TestEvidenceAggregatesAcrossRuns
+TestMissingProduceRequiresRealization
+TestAppendManualAssertionCreatesRunEvidence
+TestRecordGoalAttestation
 
 ⸻
 
 Milestone 3 — Policy and approval gates
 
-Deliverables:
+Status: Partial.
+
+Done:
 
 project policy
-user policy
-most-restrictive-wins resolution
-permission classes
-network default forbidden
-CredentialRef model
-sanitized environment
-approval prompts grouped by effect class
+user policy loaded from ~/.config/rp/policy.yaml
+most-restrictive-wins merging for implemented permission dimensions
+permission checks for process execution, filesystem writes, network, credentials,
+and selected external side effects
+network default forbidden when a capability declares network effects
+CredentialRef input detection
+sanitized command environment
+filesystem write and destructive-write approval prompts
 dry run
 step mode
+goal-level permission constraints
+max-cost constraints
 
-Success test:
+Partial:
 
-A capability declaring filesystem writes prompts for approval.
-A capability declaring network is rejected by local-safe policy.
-A command receives only the allowed environment.
+Approval prompts are not generally grouped by arbitrary effect class; they are
+implemented for filesystem write classes.
+CredentialRef is a resource/input type marker, not a credential provider model.
+Policy merging covers implemented maps and rules, not every possible future
+policy dimension.
+
+Tests and evidence:
+
+TestMergePoliciesMostRestrictive
+TestCheckCapabilityPolicyRejectsForbiddenNetwork
+TestCheckCapabilityPolicyRejectsForbiddenProcess
+TestCheckCapabilityPolicyRejectsCredentialRefInput
+TestCheckCapabilityPolicyRejectsForbiddenExternalSideEffect
+TestCapabilityDestructiveWriteApproval
+TestCommandReceivesOnlyAllowedEnvironment
+TestDryRunPrintsEffectSummary
+TestValidatePlanMaxCostRejectsExpensivePlan
 
 ⸻
 
 Milestone 4 — Provisional planning and replanning
 
-Deliverables:
+Status: Partial.
 
-backward-chaining planner
+Done:
+
+simple backward-chaining planner
+deterministic plan ordering
 evidence gap detection
-validation action insertion
-provisional full plan
-plan invalidation after observations
-policy-controlled plan changes
+precondition/validation action insertion
+provisional full plan display
+saved plan snapshots
+rp exec for saved plans
+plan invalidation after failed observations or unmet preconditions
+policy-controlled confirmation for riskier plan revisions
 failure behavior: record, stop, suggest replan
 rp replan
+rp rerun
+auto-repair retries with repair-purpose capabilities
 DOT and Mermaid output
+speculative plans that do not save snapshots
 
-Success test:
+Partial:
 
-A bugfix goal creates a provisional plan:
-observe clean tree → propose patch → check patch applies → apply patch → run tests.
-If patch apply fails, rp records the failure and suggests a repair/replan path if one exists.
+The planner is a deterministic vertical-slice search, not a general solver.
+Recursive just-in-time replanning is implemented around missing goal evidence
+and failures, but not a full HTN/PDDL-style planner.
+Validation insertion is based on declared input/precondition requirements and
+matching assertion capabilities.
+
+Tests and evidence:
+
+TestBuildPlanBugfixOrdering
+TestBuildPlanGeneralizesBeyondBugfix
+TestPlanAssumptionsListsPreconditions
+TestCheckStepPreconditions
+TestPlanRevisionNeedsConfirmation
+TestBuildPlanIncludesRepairCapabilitiesOnDemand
+TestAutoRepairRetriesBeforeStopping
+TestSpeculativePlanDoesNotSave
+TestRenderPlan
 
 ⸻
 
 Milestone 5 — Tutorial bugfix project
 
-Deliverables:
+Status: Complete for the current tutorial.
+
+Done:
 
 example repo
 bug.md
 scripts/propose_patch.sh
-capability templates for Git-as-commands
+Git-as-command capabilities
+GitRepo independence validation before execution
 patch apply check
 test runner
 local-safe policy
-complete docs walkthrough
-audit/replay commands
+walkthrough docs
+doctested console examples
+rp evidence output
+rp audit output
+rp replay output
 
-Success test:
+Tests and evidence:
 
-rp achieve bugfix_patch produces:
+TestExampleProjectBugfixAchieve verifies:
   .rp/runs/<run>/artifacts/proposed.patch
-  pytest stdout/stderr artifacts
+  pytest stdout artifact
   event log
   summary
   evidence that patch applies
   evidence that tests pass
-  rp evidence bugfix_patch output
-  rp audit run output
+
+TestEvidenceReportShowsRequirementStatus
+TestAuditPrintsSummaryHeader
+TestReplayPrintsNarrative
+internal/gitrepo tests
+TestDocExamples
 
 ⸻
 
